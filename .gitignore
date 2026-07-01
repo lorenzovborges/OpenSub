@@ -1,0 +1,35 @@
+# Rust build output
+/target/
+
+# macOS / editor noise
+.DS_Store
+**/.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local OpenSub state and credentials
+.opensub/
+auth.json
+api_key
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Cloudflare tunnel credentials/config generated locally
+.cloudflared/
+*.cfargotunnel.com.json
+cert.pem
+
+# Logs and temporary files
+*.log
+*.pid
+tmp/
+temp/

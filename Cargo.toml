@@ -1,0 +1,47 @@
+[package]
+name = "opensub"
+version = "0.1.0"
+edition = "2024"
+description = "A lightweight OpenAI-compatible API that routes to Codex using your ChatGPT subscription"
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "io-util", "net"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures = "0.3"
+tokio-stream = "0.1"
+
+# HTTP server + client
+axum = { version = "0.8", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+bytes = "1"
+
+# Serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# PKCE / state / JWT parsing
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.9"
+
+# URL form-encoding + browser
+url = "2"
+urlencoding = "2"
+webbrowser = "1"
+
+# Errors + CLI
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+strip = true
+lto = true
+panic = "abort"
+codegen-units = 1
