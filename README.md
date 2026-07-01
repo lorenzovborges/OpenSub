@@ -288,3 +288,9 @@ cargo build --release
 
 Release profile is configured with `strip`, `lto`, `panic = "abort"`, and
 `codegen-units = 1` for a small, optimized binary.
+
+---
+
+## License
+
+OpenSub is released under the [MIT License](LICENSE).
