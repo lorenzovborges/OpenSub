@@ -79,7 +79,13 @@ pub fn translate(req: &ChatCompletionRequest) -> Result<ResponsesRequest> {
     // serve them anyway.
     for t in &req.tools {
         let Some(func) = t.as_function() else {
-            tracing::debug!(tool = ?t.0, "dropping non-function tool");
+            tracing::debug!(
+                tool_type =
+                    t.0.get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown"),
+                "dropping non-function tool"
+            );
             continue;
         };
         let mut tool = serde_json::Map::new();

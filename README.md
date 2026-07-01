@@ -112,6 +112,7 @@ opensub serve --port 9000 --host 127.0.0.1
 | `OPENSUB_PORT` | `8788` | Bind port |
 | `OPENSUB_API_KEY` | *(auto-generated)* | The key clients must present. If unset, one is generated and persisted to `~/.opensub/api_key` |
 | `OPENSUB_UPSTREAM` | `https://chatgpt.com/backend-api/codex` | Inference upstream base URL |
+| `OPENSUB_ALLOW_CUSTOM_UPSTREAM` | *(unset)* | Set to `1` only when you intentionally want to send your OAuth token to a custom `OPENSUB_UPSTREAM` |
 | `OPENSUB_HOME` | `~/.opensub` | Data directory (tokens, api key) |
 | `OPENSUB_USER_AGENT_VERSION` | `local` | Version in the `opencode/<v>` User-Agent |
 | `RUST_LOG` | `opensub=info` | Log level |
@@ -224,6 +225,11 @@ OpenSub now streams frames incrementally.
 Means the upstream is set to `api.openai.com/v1` (public Responses endpoint),
 which the subscription token can't access. Use the default
 `chatgpt.com/backend-api/codex` upstream instead.
+
+### `refusing to send OAuth token to unsupported OPENSUB_UPSTREAM host`
+OpenSub only sends your ChatGPT OAuth token to `chatgpt.com` or
+`api.openai.com` by default. If you are intentionally testing a trusted custom
+proxy, set `OPENSUB_ALLOW_CUSTOM_UPSTREAM=1`.
 
 ### `400 Stream must be set to true`
 The Codex backend mandates streaming. OpenSub always streams upstream now and

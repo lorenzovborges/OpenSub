@@ -123,9 +123,53 @@ pub fn upstream() -> String {
         .unwrap_or_else(|_| "https://chatgpt.com/backend-api/codex".to_string())
 }
 
+/// Validate the configured upstream before sending a ChatGPT OAuth token to it.
+///
+/// Custom upstreams are useful for debugging, but they receive the bearer token.
+/// Keep them behind an explicit opt-in so a typo or hostile environment does not
+/// silently exfiltrate credentials.
+pub fn validated_upstream() -> anyhow::Result<String> {
+    let upstream = upstream();
+    if upstream_allowed(&upstream, custom_upstream_allowed()) {
+        Ok(upstream)
+    } else {
+        anyhow::bail!(
+            "refusing to send OAuth token to unsupported OPENSUB_UPSTREAM host. \
+             Allowed hosts are chatgpt.com and api.openai.com. \
+             Set OPENSUB_ALLOW_CUSTOM_UPSTREAM=1 only if you trust the upstream."
+        )
+    }
+}
+
+fn custom_upstream_allowed() -> bool {
+    matches!(
+        std::env::var("OPENSUB_ALLOW_CUSTOM_UPSTREAM")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
+}
+
+fn upstream_allowed(upstream: &str, allow_custom: bool) -> bool {
+    if allow_custom {
+        return true;
+    }
+    let Ok(url) = url::Url::parse(upstream) else {
+        return false;
+    };
+    if url.scheme() != "https" {
+        return false;
+    }
+    matches!(url.host_str(), Some("chatgpt.com") | Some("api.openai.com"))
+}
+
 /// Whether the upstream is the ChatGPT backend (requires extra headers).
-pub fn is_chatgpt_upstream() -> bool {
-    upstream().contains("chatgpt.com")
+pub fn is_chatgpt_upstream_url(upstream: &str) -> bool {
+    url::Url::parse(upstream)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host == "chatgpt.com"))
+        .unwrap_or(false)
 }
 
 /// User-Agent version sent on token calls as `opencode/<v>` (default `local`,
@@ -157,4 +201,36 @@ pub fn session_id() -> &'static str {
 /// depends on being treated as a normal Codex session.
 pub fn codex_user_agent() -> &'static str {
     "codex_cli_rs/0.120.0 (opensub)"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_allowlist_accepts_known_https_hosts() {
+        assert!(upstream_allowed(
+            "https://chatgpt.com/backend-api/codex",
+            false
+        ));
+        assert!(upstream_allowed("https://api.openai.com/v1", false));
+    }
+
+    #[test]
+    fn upstream_allowlist_rejects_custom_or_insecure_hosts_without_opt_in() {
+        assert!(!upstream_allowed("https://evil.example/responses", false));
+        assert!(!upstream_allowed(
+            "http://chatgpt.com/backend-api/codex",
+            false
+        ));
+        assert!(!upstream_allowed(
+            "https://evil-chatgpt.com/backend-api/codex",
+            false
+        ));
+    }
+
+    #[test]
+    fn upstream_allowlist_allows_custom_hosts_with_explicit_opt_in() {
+        assert!(upstream_allowed("https://local-proxy.example/v1", true));
+    }
 }

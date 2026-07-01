@@ -111,10 +111,15 @@ We empirically confirmed this: the public endpoint returns
 when `chatgpt-account-id` and `originator: codex_cli_rs` are sent.
 
 **Default upstream** is therefore `https://chatgpt.com/backend-api/codex`.
-`config::is_chatgpt_upstream()` detects this and adds the extra identity headers
+`config::is_chatgpt_upstream_url()` detects this and adds the extra identity headers
 automatically in `codex/client.rs`. If you ever want to test the public
 endpoint, `OPENSUB_UPSTREAM=https://api.openai.com/v1 opensub probe` reproduces
 the 401.
+
+Because the upstream receives the ChatGPT OAuth bearer token, `config::validated_upstream()`
+only allows `https://chatgpt.com/...` and `https://api.openai.com/...` by
+default. Custom upstreams require `OPENSUB_ALLOW_CUSTOM_UPSTREAM=1` and should
+only be used with a trusted proxy.
 
 **The ChatGPT backend mandates `stream: true`** (returns
 `400 "Stream must be set to true"` otherwise). So `api/mod.rs` always sets

@@ -404,7 +404,11 @@ pub fn translate_stream(
                 match serde_json::from_str::<crate::types::responses::ResponsesStreamEvent>(rest) {
                     Ok(ev) => ev,
                     Err(e) => {
-                        tracing::warn!(data = rest, err = %e, "unparseable SSE event");
+                        tracing::warn!(
+                            bytes = rest.len(),
+                            err = %e,
+                            "unparseable SSE event"
+                        );
                         continue;
                     }
                 };

@@ -20,7 +20,8 @@ pub async fn post_responses_stream(
         .user_agent(config::codex_user_agent())
         .build()?;
 
-    let url = format!("{}/responses", config::upstream().trim_end_matches('/'));
+    let upstream = config::validated_upstream()?;
+    let url = format!("{}/responses", upstream.trim_end_matches('/'));
     let prompt_cache_key = body
         .get("prompt_cache_key")
         .and_then(|v| v.as_str())
@@ -36,7 +37,7 @@ pub async fn post_responses_stream(
         .json(body);
 
     // ChatGPT backend (fallback upstream) requires extra identity headers.
-    let req = if config::is_chatgpt_upstream() {
+    let req = if config::is_chatgpt_upstream_url(&upstream) {
         let mut h = req;
         if let Some(acct) = &tokens.account_id {
             h = h.header("chatgpt-account-id", acct);
@@ -90,7 +91,8 @@ pub async fn probe(tokens: &TokenData) -> Result<()> {
     let client = Client::builder()
         .user_agent(config::codex_user_agent())
         .build()?;
-    let url = format!("{}/responses", config::upstream().trim_end_matches('/'));
+    let upstream = config::validated_upstream()?;
+    let url = format!("{}/responses", upstream.trim_end_matches('/'));
     let body_json = serde_json::to_value(&body)?;
     let prompt_cache_key = body_json
         .get("prompt_cache_key")
@@ -105,14 +107,14 @@ pub async fn probe(tokens: &TokenData) -> Result<()> {
         .header("session_id", prompt_cache_key)
         .header("x-codex-installation-id", config::session_id())
         .json(&body_json);
-    if config::is_chatgpt_upstream() {
+    if config::is_chatgpt_upstream_url(&upstream) {
         if let Some(acct) = &tokens.account_id {
             req = req.header("chatgpt-account-id", acct);
         }
         req = req.header("originator", "codex_cli_rs");
     }
     let resp = req.send().await.context("probe request failed")?;
-    println!("→ upstream: {}", config::upstream());
+    println!("→ upstream: {}", upstream);
     println!("→ account_id: {:?}", tokens.account_id);
     println!("→ status:   {}", resp.status());
 

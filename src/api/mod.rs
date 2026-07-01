@@ -71,7 +71,13 @@ async fn chat_completions(
     let mut prepared = prepare_upstream_body(raw).map_err(ApiError::Translate)?;
     prepared.body["stream"] = Value::Bool(true);
 
-    tracing::debug!(body = %prepared.body, "prepared upstream request");
+    tracing::debug!(
+        model = %prepared.model,
+        input_count = json_array_len(&prepared.body, "input"),
+        tool_count = json_array_len(&prepared.body, "tools"),
+        has_prompt_cache_key = prepared.body.get("prompt_cache_key").is_some(),
+        "prepared upstream request"
+    );
 
     let tokens = auth::require_token().await.map_err(ApiError::Auth)?;
     let upstream = codex::client::post_responses_stream(&tokens, &prepared.body)
@@ -263,6 +269,14 @@ fn content_value_to_string(value: &Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn json_array_len(value: &Value, key: &str) -> usize {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
 }
 
 /// Build a non-streaming Chat Completions JSON response from the translated
