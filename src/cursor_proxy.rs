@@ -7,14 +7,14 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::sync::{mpsc, mpsc::RecvTimeoutError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -28,7 +28,7 @@ use hudsucker::rcgen::{
 use hudsucker::rustls::{self, ServerConfig, crypto::aws_lc_rs};
 use hudsucker::{Body, HttpContext, HttpHandler, Proxy, RequestOrResponse};
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
+use sha2::{Digest, Sha256};
 use tokio_rustls::TlsAcceptor;
 
 use crate::config;
@@ -40,6 +40,11 @@ const CURSOR_SETTINGS_BACKUP_NAME: &str = "cursor-settings-backup.json";
 const UNDICI_PRELOAD_NAME: &str = "undici-proxy-preload.cjs";
 const MITMPROXY_ADDON_NAME: &str = "opensub_capture.py";
 const UPSTREAM_CA_BUNDLE_NAME: &str = "upstream-ca-bundle.pem";
+const SERVICE_LABEL: &str = "com.opensub.cursor-proxy";
+const SERVICE_PLIST_NAME: &str = "com.opensub.cursor-proxy.plist";
+const SERVICE_STATE_NAME: &str = "service-state.json";
+const SERVICE_LOG_NAME: &str = "service.log";
+const SERVICE_ERROR_LOG_NAME: &str = "service-error.log";
 
 const MITMPROXY_ADDON: &str = r#"from mitmproxy import http
 import json
@@ -221,10 +226,141 @@ impl HttpHandler for CursorProxyHandler {
     }
 }
 
-pub async fn run(capture_protocol: bool) -> Result<()> {
+#[derive(Serialize, Deserialize)]
+struct CursorServiceState {
+    pid: u32,
+    ready_at_ms: u64,
+}
+
+pub async fn ensure_service() -> Result<()> {
     require_macos()?;
     require_official_cursor()?;
-    require_mitmdump()?;
+    let mitmdump = require_mitmdump()?;
+    if !crate::auth::is_logged_in() {
+        bail!("not logged in - run `opensub login` first");
+    }
+
+    let (_, _, cert_path, _, _) = prepare_local_capture_files()?;
+    let executable = std::env::current_exe()
+        .context("failed to locate the OpenSub executable")?
+        .canonicalize()
+        .context("failed to resolve the OpenSub executable")?;
+    let plist = service_plist(&executable, &mitmdump)?;
+    let plist_path = service_plist_path()?;
+    let installed_current = fs::read(&plist_path).is_ok_and(|current| current == plist.as_bytes());
+    let healthy = installed_current && service_is_loaded()? && service_is_ready();
+
+    if healthy {
+        println!("→ Cursor proxy service: active");
+        println!("→ Starts automatically at login.");
+        if !cursor_is_running() {
+            launch_cursor_direct(&cert_path)?;
+            println!("→ Official Cursor launched.");
+        }
+        return Ok(());
+    }
+
+    let cursor_was_running = cursor_is_running();
+    let _ = stop_legacy_proxy_processes()?;
+    bootout_service()?;
+    remove_service_state_if_present()?;
+    prepare_service_logs()?;
+    replace_file(&plist_path, plist.as_bytes(), 0o600)?;
+    validate_service_plist(&plist_path)?;
+    bootstrap_service(&plist_path)?;
+    wait_for_service_ready()?;
+
+    if cursor_was_running {
+        if refresh_cursor_network_service()? {
+            println!("→ Cursor remained open; network connections refreshed.");
+        } else {
+            let cursor_stopped = stop_cursor_if_running()?;
+            let mut relaunch_guard = CursorRelaunchGuard::new(cursor_stopped, cert_path.clone());
+            launch_cursor_direct(&cert_path)?;
+            relaunch_guard.disarm();
+            println!("→ Official Cursor relaunched.");
+        }
+    } else {
+        launch_cursor_direct(&cert_path)?;
+        println!("→ Official Cursor launched.");
+    }
+    println!("→ Cursor proxy service: installed and active");
+    println!("→ Starts automatically at login.");
+    println!("→ No terminal needs to stay open.");
+    Ok(())
+}
+
+pub fn service_status() -> Result<()> {
+    require_macos()?;
+    let installed = service_plist_path()?.exists();
+    let loaded = service_is_loaded()?;
+    let ready = loaded && service_is_ready();
+    println!(
+        "→ Cursor proxy service: {}",
+        if ready {
+            "active"
+        } else if loaded {
+            "starting"
+        } else if installed {
+            "installed, stopped"
+        } else {
+            "not installed"
+        }
+    );
+    if installed {
+        println!("→ Starts automatically at login.");
+        println!("→ Logs: {}", service_log_path().display());
+    }
+    Ok(())
+}
+
+pub fn service_stop() -> Result<()> {
+    require_macos()?;
+    bootout_service()?;
+    remove_service_state_if_present()?;
+    println!("→ Cursor proxy service stopped.");
+    println!("→ Run `opensub cursor proxy` to start it again.");
+    Ok(())
+}
+
+pub fn service_uninstall() -> Result<()> {
+    require_macos()?;
+    bootout_service()?;
+    remove_service_state_if_present()?;
+    remove_file_if_present(&service_plist_path()?)?;
+    remove_file_if_present(&service_log_path())?;
+    remove_file_if_present(&service_error_log_path())?;
+    println!("→ Cursor proxy service uninstalled.");
+    println!("→ OAuth tokens and the local CA were kept.");
+    Ok(())
+}
+
+pub async fn run_diagnostic() -> Result<()> {
+    require_macos()?;
+    let restart_service = service_plist_path()?.exists();
+    bootout_service()?;
+    remove_service_state_if_present()?;
+    let result = run_capture(true, true, false).await;
+    if restart_service {
+        let restart = ensure_service().await;
+        result.and(restart)
+    } else {
+        result
+    }
+}
+
+pub async fn run_service_worker() -> Result<()> {
+    run_capture(false, false, true).await
+}
+
+async fn run_capture(
+    capture_protocol: bool,
+    manage_cursor: bool,
+    service_worker: bool,
+) -> Result<()> {
+    require_macos()?;
+    require_official_cursor()?;
+    let mitmdump = require_mitmdump()?;
     if !crate::auth::is_logged_in() {
         bail!("not logged in - run `opensub login` first");
     }
@@ -236,8 +372,11 @@ pub async fn run(capture_protocol: bool) -> Result<()> {
         fs::remove_file(&capture_path)?;
     }
 
-    let cursor_was_running = stop_cursor_if_running()?;
+    let cursor_was_running = manage_cursor && stop_cursor_if_running()?;
     let mut relaunch_guard = CursorRelaunchGuard::new(cursor_was_running, cert_path.clone());
+    if manage_cursor {
+        let _ = stop_legacy_proxy_processes()?;
+    }
 
     let bridge_secret =
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
@@ -253,21 +392,32 @@ pub async fn run(capture_protocol: bool) -> Result<()> {
     )?);
     let bridge_task = tokio::spawn(async move { axum::serve(bridge_listener, bridge).await });
 
-    let (guard, events) = start_local_capture(
-        &confdir,
-        &addon_path,
+    let (guard, events) = start_local_capture(LocalCaptureConfig {
+        mitmdump: &mitmdump,
+        confdir: &confdir,
+        addon_path: &addon_path,
         capture_protocol,
         bridge_port,
-        &bridge_secret,
-        &upstream_ca_bundle,
-    )?;
+        bridge_secret: &bridge_secret,
+        upstream_ca_bundle: &upstream_ca_bundle,
+        show_events: !service_worker,
+    })?;
     wait_for_local_capture(&events)?;
-    launch_cursor_direct(&cert_path)?;
-    relaunch_guard.disarm();
+    let _service_ready = if service_worker {
+        Some(ServiceReadyGuard::activate()?)
+    } else {
+        None
+    };
+    if manage_cursor {
+        launch_cursor_direct(&cert_path)?;
+        relaunch_guard.disarm();
+    }
 
     println!("→ Cursor traffic capture: active");
-    println!("→ Official Cursor launched; only Cursor processes are captured.");
-    println!("→ Non-Cursor applications are not routed through OpenSub.");
+    if manage_cursor {
+        println!("→ Official Cursor launched; only Cursor processes are captured.");
+        println!("→ Non-Cursor applications are not routed through OpenSub.");
+    }
     println!(
         "→ Bridge events: {}",
         crate::cursor_agent::event_log_path().display()
@@ -276,11 +426,13 @@ pub async fn run(capture_protocol: bool) -> Result<()> {
         println!("→ GPT protocol requests are captured locally and blocked upstream.");
         println!("→ Protocol capture: {}", capture_path.display());
     }
-    println!("→ Ctrl-C stops the capture.\n");
+    if manage_cursor {
+        println!("→ Ctrl-C stops the capture.\n");
+    }
 
     let exit_wait = tokio::task::spawn_blocking(move || events.recv());
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
+        _ = shutdown_signal() => {}
         event = exit_wait => {
             match event {
                 Ok(Ok(LocalCaptureEvent::Exited(code))) => {
@@ -380,6 +532,17 @@ struct LocalCaptureGuard {
     child: Arc<Mutex<Option<Child>>>,
 }
 
+struct LocalCaptureConfig<'a> {
+    mitmdump: &'a Path,
+    confdir: &'a Path,
+    addon_path: &'a Path,
+    capture_protocol: bool,
+    bridge_port: u16,
+    bridge_secret: &'a str,
+    upstream_ca_bundle: &'a Path,
+    show_events: bool,
+}
+
 impl Drop for LocalCaptureGuard {
     fn drop(&mut self) {
         if let Ok(mut child) = self.child.lock() {
@@ -392,20 +555,408 @@ impl Drop for LocalCaptureGuard {
     }
 }
 
-fn require_mitmdump() -> Result<()> {
-    let status = Command::new("mitmdump")
+struct ServiceReadyGuard {
+    pid: u32,
+}
+
+impl ServiceReadyGuard {
+    fn activate() -> Result<Self> {
+        let pid = std::process::id();
+        let ready_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or_default();
+        let state = serde_json::to_vec(&CursorServiceState { pid, ready_at_ms })?;
+        replace_file(&service_state_path(), &state, 0o600)?;
+        Ok(Self { pid })
+    }
+}
+
+impl Drop for ServiceReadyGuard {
+    fn drop(&mut self) {
+        let path = service_state_path();
+        let owns_state = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<CursorServiceState>(&bytes).ok())
+            .is_some_and(|state| state.pid == self.pid);
+        if owns_state {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn require_mitmdump() -> Result<PathBuf> {
+    let executable = mitmdump_executable();
+    let status = Command::new(&executable)
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
     if status.is_ok_and(|status| status.success()) {
-        Ok(())
+        Ok(executable)
     } else {
         bail!(
             "mitmdump is required for process-level Cursor capture; install it with \
              `brew install --cask mitmproxy`"
         )
     }
+}
+
+fn mitmdump_executable() -> PathBuf {
+    if let Some(path) = std::env::var_os("OPENSUB_MITMDUMP") {
+        return PathBuf::from(path);
+    }
+    [
+        "/opt/homebrew/bin/mitmdump",
+        "/usr/local/bin/mitmdump",
+        "/usr/bin/mitmdump",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
+    .unwrap_or_else(|| PathBuf::from("mitmdump"))
+}
+
+fn service_dir() -> PathBuf {
+    config::data_dir().join("cursor-proxy")
+}
+
+fn service_state_path() -> PathBuf {
+    service_dir().join(SERVICE_STATE_NAME)
+}
+
+fn service_log_path() -> PathBuf {
+    service_dir().join(SERVICE_LOG_NAME)
+}
+
+fn service_error_log_path() -> PathBuf {
+    service_dir().join(SERVICE_ERROR_LOG_NAME)
+}
+
+fn service_plist_path() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home)
+        .join("Library")
+        .join("LaunchAgents")
+        .join(SERVICE_PLIST_NAME))
+}
+
+fn service_plist(executable: &Path, mitmdump: &Path) -> Result<String> {
+    let home = std::env::var("HOME").context("HOME is not set")?;
+    let executable_hash = hex_sha256(&fs::read(executable)?);
+    let mut environment = vec![
+        ("HOME".to_string(), home),
+        (
+            "PATH".to_string(),
+            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string(),
+        ),
+        (
+            "OPENSUB_MITMDUMP".to_string(),
+            mitmdump.display().to_string(),
+        ),
+        (
+            "OPENSUB_SERVICE_EXECUTABLE_SHA256".to_string(),
+            executable_hash,
+        ),
+        ("NO_COLOR".to_string(), "1".to_string()),
+    ];
+    for name in [
+        "OPENSUB_HOME",
+        "OPENSUB_CURSOR_MODEL",
+        "OPENSUB_UPSTREAM",
+        "OPENSUB_ALLOW_CUSTOM_UPSTREAM",
+        "OPENSUB_USER_AGENT_VERSION",
+        "RUST_LOG",
+    ] {
+        if let Ok(value) = std::env::var(name) {
+            environment.push((name.to_string(), value));
+        }
+    }
+    environment.sort_by(|left, right| left.0.cmp(&right.0));
+    let environment = environment
+        .into_iter()
+        .map(|(key, value)| {
+            format!(
+                "        <key>{}</key>\n        <string>{}</string>",
+                xml_escape(&key),
+                xml_escape(&value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{executable}</string>
+        <string>cursor</string>
+        <string>worker</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+{environment}
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>{stdout}</string>
+    <key>StandardErrorPath</key>
+    <string>{stderr}</string>
+</dict>
+</plist>
+"#,
+        label = SERVICE_LABEL,
+        executable = xml_escape(&executable.display().to_string()),
+        stdout = xml_escape(&service_log_path().display().to_string()),
+        stderr = xml_escape(&service_error_log_path().display().to_string()),
+    ))
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn prepare_service_logs() -> Result<()> {
+    fs::create_dir_all(service_dir())?;
+    fs::set_permissions(service_dir(), fs::Permissions::from_mode(0o700))?;
+    for path in [service_log_path(), service_error_log_path()] {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn launchctl_domain() -> Result<String> {
+    let output = Command::new("/usr/bin/id")
+        .arg("-u")
+        .output()
+        .context("failed to determine the macOS user ID")?;
+    if !output.status.success() {
+        bail!("could not determine the macOS user ID");
+    }
+    Ok(format!(
+        "gui/{}",
+        String::from_utf8_lossy(&output.stdout).trim()
+    ))
+}
+
+fn launchctl_target() -> Result<String> {
+    Ok(format!("{}/{}", launchctl_domain()?, SERVICE_LABEL))
+}
+
+fn service_is_loaded() -> Result<bool> {
+    Ok(Command::new("/bin/launchctl")
+        .args(["print", &launchctl_target()?])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("failed to inspect the Cursor proxy service")?
+        .success())
+}
+
+fn service_is_ready() -> bool {
+    fs::read(service_state_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<CursorServiceState>(&bytes).ok())
+        .is_some_and(|state| worker_pid_is_alive(state.pid))
+}
+
+fn worker_pid_is_alive(pid: u32) -> bool {
+    let output = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output();
+    output.is_ok_and(|output| {
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("cursor worker")
+    })
+}
+
+fn validate_service_plist(path: &Path) -> Result<()> {
+    let output = Command::new("/usr/bin/plutil")
+        .args(["-lint", "--"])
+        .arg(path)
+        .output()
+        .context("failed to validate the Cursor proxy LaunchAgent")?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        bail!(
+            "invalid Cursor proxy LaunchAgent: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+}
+
+fn bootstrap_service(plist_path: &Path) -> Result<()> {
+    let output = Command::new("/bin/launchctl")
+        .args(["bootstrap", &launchctl_domain()?])
+        .arg(plist_path)
+        .output()
+        .context("failed to start the Cursor proxy service")?;
+    if !output.status.success() {
+        bail!(
+            "launchctl could not start the Cursor proxy service: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn bootout_service() -> Result<()> {
+    if !service_is_loaded()? {
+        return Ok(());
+    }
+    let output = Command::new("/bin/launchctl")
+        .args(["bootout", &launchctl_target()?])
+        .output()
+        .context("failed to stop the Cursor proxy service")?;
+    if !output.status.success() {
+        bail!(
+            "launchctl could not stop the Cursor proxy service: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while service_is_ready() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+fn wait_for_service_ready() -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while Instant::now() < deadline {
+        if service_is_ready() {
+            return Ok(());
+        }
+        if !service_is_loaded()? {
+            bail!(
+                "Cursor proxy service exited during startup; inspect {}",
+                service_error_log_path().display()
+            );
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    bail!(
+        "timed out waiting for the Cursor proxy service; inspect {}",
+        service_error_log_path().display()
+    )
+}
+
+fn remove_service_state_if_present() -> Result<()> {
+    remove_file_if_present(&service_state_path())
+}
+
+fn remove_file_if_present(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn stop_legacy_proxy_processes() -> Result<bool> {
+    let output = Command::new("/usr/bin/pgrep")
+        .args(["-x", "opensub"])
+        .output();
+    let Ok(output) = output else {
+        return Ok(false);
+    };
+    let current_pid = std::process::id();
+    let mut legacy_pids = Vec::new();
+    for pid in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .filter(|pid| *pid != current_pid)
+    {
+        let command = Command::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output();
+        if command.is_ok_and(|command| {
+            let command = String::from_utf8_lossy(&command.stdout);
+            command.contains("cursor proxy") && !command.contains("cursor worker")
+        }) {
+            legacy_pids.push(pid);
+        }
+    }
+    for pid in &legacy_pids {
+        let _ = Command::new("/bin/kill")
+            .args(["-INT", &pid.to_string()])
+            .status();
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while legacy_pids.iter().any(|pid| process_exists(*pid)) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    if legacy_pids.iter().any(|pid| process_exists(*pid)) {
+        bail!("an older foreground Cursor proxy did not stop cleanly");
+    }
+    Ok(!legacy_pids.is_empty())
+}
+
+fn refresh_cursor_network_service() -> Result<bool> {
+    let output = Command::new("/bin/ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+        .context("failed to inspect Cursor network processes")?;
+    let pids = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| {
+            line.contains("/Applications/Cursor.app/")
+                && line.contains("Cursor Helper")
+                && line.contains("network.mojom.NetworkService")
+        })
+        .filter_map(|line| line.split_whitespace().next()?.parse::<u32>().ok())
+        .collect::<Vec<_>>();
+    for pid in &pids {
+        let status = Command::new("/bin/kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .context("failed to refresh Cursor network connections")?;
+        if !status.success() {
+            bail!("could not refresh Cursor network connections");
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pids.iter().any(|pid| process_exists(*pid)) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    Ok(!pids.is_empty())
+}
+
+fn process_exists(pid: u32) -> bool {
+    Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn prepare_local_capture_files() -> Result<(PathBuf, PathBuf, PathBuf, PathBuf, PathBuf)> {
@@ -548,19 +1099,14 @@ fn certificate_sha256_fingerprint(cert_path: &Path) -> Result<String> {
 }
 
 fn start_local_capture(
-    confdir: &Path,
-    addon_path: &Path,
-    capture_protocol: bool,
-    bridge_port: u16,
-    bridge_secret: &str,
-    upstream_ca_bundle: &Path,
+    config: LocalCaptureConfig<'_>,
 ) -> Result<(LocalCaptureGuard, mpsc::Receiver<LocalCaptureEvent>)> {
     let process_filter = "local:Cursor,Cursor Helper,Cursor Helper (Plugin)";
-    let mut child = Command::new("mitmdump")
+    let mut child = Command::new(config.mitmdump)
         .args(["--mode", process_filter])
         .args(["--allow-hosts", r"(^|\.)cursor\.sh:443$"])
         .arg("--set")
-        .arg(format!("confdir={}", confdir.display()))
+        .arg(format!("confdir={}", config.confdir.display()))
         .args(["--set", "flow_detail=0"])
         .args(["--set", "termlog_verbosity=info"])
         .args(["--set", "block_global=false"])
@@ -568,16 +1114,16 @@ fn start_local_capture(
         .arg("--set")
         .arg(format!(
             "ssl_verify_upstream_trusted_ca={}",
-            upstream_ca_bundle.display()
+            config.upstream_ca_bundle.display()
         ))
         .args(["--scripts"])
-        .arg(addon_path)
+        .arg(config.addon_path)
         .env(
             "OPENSUB_CAPTURE_PROTOCOL",
-            if capture_protocol { "1" } else { "0" },
+            if config.capture_protocol { "1" } else { "0" },
         )
-        .env("OPENSUB_BRIDGE_PORT", bridge_port.to_string())
-        .env("OPENSUB_BRIDGE_SECRET", bridge_secret)
+        .env("OPENSUB_BRIDGE_PORT", config.bridge_port.to_string())
+        .env("OPENSUB_BRIDGE_SECRET", config.bridge_secret)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -589,10 +1135,15 @@ fn start_local_capture(
     let (events_tx, events_rx) = mpsc::channel();
     let ready_sent = Arc::new(AtomicBool::new(false));
     if let Some(stdout) = stdout {
-        drain_local_capture_output(stdout, events_tx.clone(), Arc::clone(&ready_sent));
+        drain_local_capture_output(
+            stdout,
+            events_tx.clone(),
+            Arc::clone(&ready_sent),
+            config.show_events,
+        );
     }
     if let Some(stderr) = stderr {
-        drain_local_capture_output(stderr, events_tx.clone(), ready_sent);
+        drain_local_capture_output(stderr, events_tx.clone(), ready_sent, config.show_events);
     }
     watch_local_capture_exit(Arc::clone(&child), events_tx);
     Ok((LocalCaptureGuard { child }, events_rx))
@@ -602,6 +1153,7 @@ fn drain_local_capture_output<R>(
     reader: R,
     events: mpsc::Sender<LocalCaptureEvent>,
     ready_sent: Arc<AtomicBool>,
+    show_events: bool,
 ) where
     R: std::io::Read + Send + 'static,
 {
@@ -612,7 +1164,7 @@ fn drain_local_capture_output<R>(
             {
                 let _ = events.send(LocalCaptureEvent::Ready);
             }
-            if let Some(event) = line.split("OPENSUB_EVENT\t").nth(1) {
+            if show_events && let Some(event) = line.split("OPENSUB_EVENT\t").nth(1) {
                 print_local_capture_event(event);
             }
         }
@@ -623,22 +1175,21 @@ fn print_local_capture_event(raw: &str) {
     let Ok(event) = serde_json::from_str::<serde_json::Value>(raw) else {
         return;
     };
-    let method = event["method"].as_str().unwrap_or("?");
-    let path = event["path"].as_str().unwrap_or("?");
-    if event["phase"].as_str() == Some("bridge") {
-        let content_length = event["content_length"].as_str().unwrap_or("stream");
-        let http_version = event["http_version"].as_str().unwrap_or("unknown");
-        println!(
-            "→ Agent bridge {method} {path} [content-length={content_length}; {http_version}]"
-        );
-        return;
+    if let Some(model) = event["model"]
+        .as_str()
+        .filter(|_| should_print_local_capture_event(&event))
+    {
+        println!("→ OpenAI request intercepted by OpenSub [model={model}]");
     }
-    let bytes = event["bytes"].as_u64().unwrap_or_default();
-    let model = event["model"].as_str().unwrap_or("unknown");
-    println!("→ Agent {method} {path} [{bytes} bytes; model={model}]");
     if event["blocked"].as_bool() == Some(true) {
         println!("→ Protocol captured locally; upstream request blocked.");
     }
+}
+
+fn should_print_local_capture_event(event: &serde_json::Value) -> bool {
+    event["model"]
+        .as_str()
+        .is_some_and(|model| model.to_ascii_lowercase().starts_with("gpt-"))
 }
 
 fn watch_local_capture_exit(
@@ -831,6 +1382,7 @@ fn replace_file(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let mut file = fs::OpenOptions::new()
         .create_new(true)
         .write(true)
+        .mode(mode)
         .open(&temp)
         .with_context(|| format!("failed to create {}", temp.display()))?;
     file.write_all(bytes)?;
@@ -907,6 +1459,7 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = fs::OpenOptions::new()
         .create_new(true)
         .write(true)
+        .mode(0o600)
         .open(path)
         .with_context(|| format!("failed to create {}", path.display()))?;
     file.write_all(bytes)?;
@@ -1007,6 +1560,7 @@ fn capture_agent_request(
         .create(true)
         .truncate(true)
         .write(true)
+        .mode(0o600)
         .open(&path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
@@ -1120,6 +1674,17 @@ impl Drop for CursorRelaunchGuard {
 }
 
 async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+            return;
+        }
+    }
     let _ = tokio::signal::ctrl_c().await;
 }
 
@@ -1147,6 +1712,33 @@ mod tests {
             Some("gpt-5.6-sol-none".to_string())
         );
         assert_eq!(detect_model(b"composer-2"), None);
+    }
+
+    #[test]
+    fn launch_agent_runs_persistent_hidden_worker() {
+        let executable = std::env::current_exe().unwrap();
+        let plist = service_plist(&executable, Path::new("/tmp/mitm&dump")).unwrap();
+        assert!(plist.contains("<string>cursor</string>"));
+        assert!(plist.contains("<string>worker</string>"));
+        assert!(plist.contains("<key>RunAtLoad</key>"));
+        assert!(plist.contains("<key>KeepAlive</key>"));
+        assert!(plist.contains("/tmp/mitm&amp;dump"));
+        assert!(!plist.contains("auth.json"));
+        assert!(!plist.contains("access_token"));
+    }
+
+    #[test]
+    fn terminal_capture_output_only_includes_detected_gpt_models() {
+        assert!(should_print_local_capture_event(&serde_json::json!({
+            "model": "gpt-5.6-sol-none"
+        })));
+        assert!(!should_print_local_capture_event(&serde_json::json!({
+            "phase": "bridge",
+            "model": null
+        })));
+        assert!(!should_print_local_capture_event(&serde_json::json!({
+            "model": "composer-2.5"
+        })));
     }
 
     #[test]

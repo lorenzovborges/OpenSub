@@ -204,7 +204,7 @@ async fn route_request(state: BridgeState, request: Request) -> Result<Response>
         state
             .events
             .record("route_cursor", Some(&agent.requested_model));
-        tracing::info!(
+        tracing::debug!(
             model = %agent.requested_model,
             host = %original_host,
             "Cursor Agent request routed to Cursor"
@@ -216,7 +216,7 @@ async fn route_request(state: BridgeState, request: Request) -> Result<Response>
         model = %agent.requested_model,
         reasoning = %agent.reasoning_effort.as_deref().unwrap_or("default"),
         mcp_tools = agent.mcp_tools.len(),
-        "Cursor Agent request routed to OpenSub"
+        "OpenAI request intercepted by OpenSub"
     );
     state
         .events
@@ -401,7 +401,7 @@ async fn stream_openai_agent(
         }
 
         for call in round.tool_calls {
-            tracing::info!(tool = %call.name, "Cursor tool execution requested");
+            tracing::debug!(tool = %call.name, "Cursor tool execution requested");
             events.record("tool_requested", Some(&call.name));
             let execution = ToolExecution::from_call(&call, &mcp_tools, exec_sequence)?;
             exec_sequence = exec_sequence.saturating_add(1);
@@ -631,7 +631,7 @@ fn load_conversation_material(agent: &AgentRequest) -> ConversationMaterial {
     }
 
     let available = values.iter().flatten().count();
-    tracing::info!(
+    tracing::debug!(
         available_context_blobs = available,
         omitted_context_blobs = ids.len().saturating_sub(available),
         "Cursor context prepared from prefetched blobs"

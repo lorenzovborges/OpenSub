@@ -314,9 +314,28 @@ bundled.)
 filter limited to Cursor, Cursor Helper, and Cursor Helper (Plugin). The addon
 rewrites only `/agent.v1.AgentService/Run` to an ephemeral localhost Axum
 listener. A random per-process secret header prevents unrelated local callers
-from using that listener. If Cursor is already running, OpenSub requests a
-graceful quit, waits for the process to exit, activates capture, and relaunches
-the official app. A startup failure after that quit also relaunches Cursor.
+from using that listener.
+
+The public `opensub cursor proxy` command manages a per-user LaunchAgent at
+`~/Library/LaunchAgents/com.opensub.cursor-proxy.plist`. The worker starts at
+login with `RunAtLoad` and `KeepAlive`, so capture is normally active before
+Cursor opens. Installation and updates are idempotent: the plist embeds a hash
+of the installed OpenSub binary, readiness is recorded by worker PID, and a
+second command invocation leaves healthy processes untouched. If Cursor is
+already open during first installation, only Electron's network service is
+restarted after capture becomes ready; the editor window remains open.
+
+The plist, worker state, and service logs use mode `0600`. The LaunchAgent
+contains paths and non-secret configuration only; OAuth tokens remain in
+`~/.opensub/auth.json`. `opensub cursor stop` unloads it, while
+`opensub cursor uninstall` removes the plist and service logs without deleting
+OAuth state or the local CA.
+
+At the default `INFO` level, request output is emitted only after the bridge has
+decoded an OpenAI model and committed the request to the OpenSub route. Native
+Cursor passthrough, telemetry, context preparation, and tool lifecycle details
+remain available in `events.jsonl` or at `DEBUG`, but do not pollute normal
+output. Every intercepted-request line includes the exact Cursor model name.
 
 The local bridge uses TLS with HTTP/2 ALPN because Cursor's Agent transport is a
 bidirectional Connect stream. OpenSub generates one private local CA, installs

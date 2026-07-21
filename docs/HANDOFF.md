@@ -147,11 +147,11 @@ auth** (middleware) so the now-public endpoint can't be abused.
 1. **Start the transparent proxy:**
    ```bash
    cd ~/CursorOpenSub
-   cargo install --path . --force
+   cargo install --path . --locked --force
    opensub cursor proxy
    ```
-   If Cursor is open, OpenSub restarts it automatically after the capture is
-   ready.
+   The command installs/updates a per-user LaunchAgent and returns. If Cursor is
+   open, only its Electron network process is refreshed after capture is ready.
    Leave Cursor's OpenAI API key and base URL overrides disabled.
 2. Use Cursor normally. For diagnosis, inspect the metadata-only
    `~/.opensub/cursor-proxy/events.jsonl`; a healthy tool turn includes
@@ -159,6 +159,8 @@ auth** (middleware) so the now-public endpoint can't be abused.
    `generation_completed`.
 3. Select Composer or Grok for a passthrough check. It should produce
    `route_cursor` and continue using the Cursor subscription.
+   Normal `INFO` output remains quiet for passthrough and prints only OpenAI
+   requests routed to OpenSub, including the exact requested model.
 
 ---
 
@@ -167,7 +169,7 @@ auth** (middleware) so the now-public endpoint can't be abused.
 ```bash
 # build & install
 cd ~/CursorOpenSub
-cargo install --path .
+cargo install --path . --locked
 brew install cloudflared   # for the tunnel
 
 # one-time login
@@ -176,9 +178,13 @@ opensub login
 # debug the upstream anytime
 opensub probe
 
-# recommended: transparent official Cursor routing
-# OpenSub restarts Cursor automatically when needed
+# recommended: persistent transparent official Cursor routing
+# installs/starts a per-user LaunchAgent and returns
 opensub cursor proxy
+
+# inspect or remove the background service
+opensub cursor status
+opensub cursor uninstall
 
 # optional OpenAI-compatible endpoint for other clients
 opensub serve --tunnel

@@ -24,7 +24,7 @@ use tracing_subscriber::EnvFilter;
     name = "opensub",
     version,
     about = "OpenAI-compatible API that routes to Codex via your ChatGPT subscription",
-    long_about = "OpenSub routes OpenAI model requests to the Codex backend, authenticated\nwith your ChatGPT (Plus/Pro) subscription via OAuth.\n\nFor transparent Cursor routing on macOS, run:\n  opensub cursor proxy\n\nOpenSub restarts Cursor automatically when needed. No Cursor API key or\nbase URL override is required."
+    long_about = "OpenSub routes OpenAI model requests to the Codex backend, authenticated\nwith your ChatGPT (Plus/Pro) subscription via OAuth.\n\nFor persistent transparent Cursor routing on macOS, run once:\n  opensub cursor proxy\n\nOpenSub installs a per-user background service. No Cursor API key or base URL\noverride is required."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -74,13 +74,22 @@ enum KeyCommand {
 
 #[derive(Subcommand)]
 enum CursorCommand {
-    /// Launch the official Cursor through OpenSub's selective local proxy.
+    /// Install and start persistent selective Cursor routing.
     Proxy {
         /// Save the latest Agent request for protocol analysis. The capture may
         /// contain prompt context and is stored locally with mode 0600.
         #[arg(long)]
         capture_protocol: bool,
     },
+    /// Show whether persistent Cursor routing is installed and active.
+    Status,
+    /// Stop Cursor routing until it is started again or the next login.
+    Stop,
+    /// Remove persistent Cursor routing from this macOS account.
+    Uninstall,
+    /// Internal LaunchAgent entrypoint.
+    #[command(hide = true)]
+    Worker,
 }
 
 #[tokio::main]
@@ -119,7 +128,16 @@ async fn cursor_command(command: Option<CursorCommand>) -> Result<()> {
     match command.unwrap_or(CursorCommand::Proxy {
         capture_protocol: false,
     }) {
-        CursorCommand::Proxy { capture_protocol } => cursor_proxy::run(capture_protocol).await,
+        CursorCommand::Proxy {
+            capture_protocol: false,
+        } => cursor_proxy::ensure_service().await,
+        CursorCommand::Proxy {
+            capture_protocol: true,
+        } => cursor_proxy::run_diagnostic().await,
+        CursorCommand::Status => cursor_proxy::service_status(),
+        CursorCommand::Stop => cursor_proxy::service_stop(),
+        CursorCommand::Uninstall => cursor_proxy::service_uninstall(),
+        CursorCommand::Worker => cursor_proxy::run_service_worker().await,
     }
 }
 

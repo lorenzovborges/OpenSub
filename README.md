@@ -45,7 +45,7 @@ clients and supports an optional Cloudflare tunnel.
 ### 1. Build & install
 
 ```bash
-cargo install --path .
+cargo install --path . --locked
 brew install --cask mitmproxy
 ```
 
@@ -64,19 +64,24 @@ Opens a browser for the ChatGPT OAuth flow. Tokens are stored at
 opensub cursor proxy
 ```
 
-OpenSub launches the official Cursor and prints only route metadata:
+OpenSub installs and starts a per-user macOS LaunchAgent:
 
 ```
-→ Cursor traffic capture: active
-→ Official Cursor launched; only Cursor processes are captured.
-→ Non-Cursor applications are not routed through OpenSub.
+→ Cursor proxy service: installed and active
+→ Starts automatically at login.
+→ No terminal needs to stay open.
 ```
 
-If Cursor is already open, OpenSub closes it gracefully and reopens it after
-the capture is ready. You do not need to manage that restart manually.
+Operational output records only OpenAI requests actually intercepted by
+OpenSub, including the model selected in Cursor. Composer, Grok, telemetry, and
+other passthrough traffic stay silent at the default log level.
+
+If Cursor is already open, OpenSub refreshes only Electron's network process
+after the capture is ready. The editor window and workspace remain open.
 
 The first run may ask macOS to approve mitmproxy's network extension and trust
-OpenSub's local certificate. Press `Ctrl-C` to stop routing.
+OpenSub's local certificate. Later logins start routing automatically before
+you open Cursor.
 
 ### 4. Use Cursor normally
 
@@ -96,7 +101,10 @@ opensub login           # sign in with ChatGPT (browser OAuth)
 opensub logout          # delete stored tokens
 opensub key             # print your API key
 opensub key rotate      # generate and persist a new API key
-opensub cursor proxy    # launch official Cursor with selective local routing
+opensub cursor proxy    # install/start persistent selective Cursor routing
+opensub cursor status   # show LaunchAgent health
+opensub cursor stop     # stop routing until restarted or the next login
+opensub cursor uninstall # remove the LaunchAgent (keeps OAuth and local CA)
 opensub cursor proxy --capture-protocol # diagnostic: capture and block one Agent request
 opensub probe           # debug: send a minimal request to the upstream
 opensub serve           # start the API server (localhost only)
@@ -112,7 +120,7 @@ Cursor currently applies an enabled OpenAI BYOK configuration to models that
 are not Claude or Gemini. That means explicitly selected Cursor models such as
 Composer and Grok can incorrectly receive the OpenSub credentials and fail.
 
-Run the process-level proxy. OpenSub restarts Cursor automatically if needed:
+Run the process-level proxy once. It remains active across logins:
 
 | Model family | Route |
 |---|---|
@@ -235,13 +243,13 @@ Cursor blocks private addresses. Start with `opensub serve --tunnel` and use the
 `https://*.trycloudflare.com` URL (with `/v1`) as the base URL.
 
 ### Tools don't execute / Cursor talks about edits instead of editing
-For `opensub cursor proxy`, reinstall the current source and run the proxy
-again. It restarts Cursor automatically. The transparent bridge streams both
-sides of the bidirectional Agent request and uses Cursor's native
+For `opensub cursor proxy`, reinstall the current source and run the command
+again. It updates and restarts the background service when the binary changes.
+The transparent bridge streams both sides of the bidirectional Agent request and uses Cursor's native
 `ExecServerMessage` shapes for workspace tools.
 
 ```bash
-cargo install --path . --force
+cargo install --path . --locked --force
 opensub cursor proxy
 ```
 
@@ -254,10 +262,10 @@ For the OpenAI-compatible `serve` mode, Responses-shaped custom tools and
 responsible for executing returned tools.
 
 ### Cursor reports `Network disconnected` or `ERR_CERT_AUTHORITY_INVALID`
-Restart `opensub cursor proxy`; it handles the Cursor restart automatically.
-OpenSub verifies that its exact local CA is present in the login Keychain and
-has user trust settings; certificate presence alone is not treated as
-sufficient.
+Run `opensub cursor proxy` again. OpenSub verifies that its exact local CA is
+present in the login Keychain and has user trust settings; certificate presence
+alone is not treated as sufficient. Use `opensub cursor status` to verify the
+LaunchAgent state.
 
 ### `tools[7]: missing field function`
 Fixed — OpenSub accepts any tool shape. In Responses-shaped Cursor requests, it
