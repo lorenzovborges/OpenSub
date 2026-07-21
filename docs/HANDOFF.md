@@ -144,12 +144,14 @@ auth** (middleware) so the now-public endpoint can't be abused.
 
 ## Immediate next steps (do these first)
 
-1. **Quit Cursor completely and start the transparent proxy:**
+1. **Start the transparent proxy:**
    ```bash
    cd ~/CursorOpenSub
    cargo install --path . --force
    opensub cursor proxy
    ```
+   If Cursor is open, OpenSub restarts it automatically after the capture is
+   ready.
    Leave Cursor's OpenAI API key and base URL overrides disabled.
 2. Use Cursor normally. For diagnosis, inspect the metadata-only
    `~/.opensub/cursor-proxy/events.jsonl`; a healthy tool turn includes
@@ -175,7 +177,7 @@ opensub login
 opensub probe
 
 # recommended: transparent official Cursor routing
-# Cursor must be fully closed before this command
+# OpenSub restarts Cursor automatically when needed
 opensub cursor proxy
 
 # optional OpenAI-compatible endpoint for other clients

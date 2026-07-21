@@ -314,7 +314,9 @@ bundled.)
 filter limited to Cursor, Cursor Helper, and Cursor Helper (Plugin). The addon
 rewrites only `/agent.v1.AgentService/Run` to an ephemeral localhost Axum
 listener. A random per-process secret header prevents unrelated local callers
-from using that listener.
+from using that listener. If Cursor is already running, OpenSub requests a
+graceful quit, waits for the process to exit, activates capture, and relaunches
+the official app. A startup failure after that quit also relaunches Cursor.
 
 The local bridge uses TLS with HTTP/2 ALPN because Cursor's Agent transport is a
 bidirectional Connect stream. OpenSub generates one private local CA, installs

@@ -24,7 +24,7 @@ use tracing_subscriber::EnvFilter;
     name = "opensub",
     version,
     about = "OpenAI-compatible API that routes to Codex via your ChatGPT subscription",
-    long_about = "OpenSub routes OpenAI model requests to the Codex backend, authenticated\nwith your ChatGPT (Plus/Pro) subscription via OAuth.\n\nFor transparent Cursor routing on macOS, quit Cursor and run:\n  opensub cursor proxy\n\nNo Cursor API key or base URL override is required."
+    long_about = "OpenSub routes OpenAI model requests to the Codex backend, authenticated\nwith your ChatGPT (Plus/Pro) subscription via OAuth.\n\nFor transparent Cursor routing on macOS, run:\n  opensub cursor proxy\n\nOpenSub restarts Cursor automatically when needed. No Cursor API key or\nbase URL override is required."
 )]
 struct Cli {
     #[command(subcommand)]

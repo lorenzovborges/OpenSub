@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::sync::{mpsc, mpsc::RecvTimeoutError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -255,7 +255,6 @@ impl HttpHandler for CursorProxyHandler {
 pub async fn run(capture_protocol: bool) -> Result<()> {
     require_macos()?;
     require_official_cursor()?;
-    require_cursor_stopped()?;
     require_mitmdump()?;
     if !crate::auth::is_logged_in() {
         bail!("not logged in - run `opensub login` first");
@@ -267,6 +266,9 @@ pub async fn run(capture_protocol: bool) -> Result<()> {
     if capture_path.exists() {
         fs::remove_file(&capture_path)?;
     }
+
+    let cursor_was_running = stop_cursor_if_running()?;
+    let mut relaunch_guard = CursorRelaunchGuard::new(cursor_was_running, cert_path.clone());
 
     let bridge_secret =
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
@@ -292,6 +294,7 @@ pub async fn run(capture_protocol: bool) -> Result<()> {
     )?;
     wait_for_local_capture(&events)?;
     launch_cursor_direct(&cert_path)?;
+    relaunch_guard.disarm();
 
     println!("→ Cursor traffic capture: active");
     println!("→ Official Cursor launched; only Cursor processes are captured.");
@@ -333,12 +336,13 @@ pub async fn run(capture_protocol: bool) -> Result<()> {
 async fn run_explicit_proxy(port: u16, capture_protocol: bool) -> Result<()> {
     require_macos()?;
     require_official_cursor()?;
-    require_cursor_stopped()?;
     if !crate::auth::is_logged_in() {
         bail!("not logged in - run `opensub login` first");
     }
 
     let (cert_path, key_path) = ensure_proxy_ca()?;
+    let cursor_was_running = stop_cursor_if_running()?;
+    let mut relaunch_guard = CursorRelaunchGuard::new(cursor_was_running, cert_path.clone());
     let cert_pem = fs::read_to_string(&cert_path)
         .with_context(|| format!("failed to read {}", cert_path.display()))?;
     let key_pem = fs::read_to_string(&key_path)
@@ -375,6 +379,7 @@ async fn run_explicit_proxy(port: u16, capture_protocol: bool) -> Result<()> {
 
     let settings_guard = CursorSettingsGuard::apply(port)?;
     launch_cursor(port, &spki, &cert_path, &preload_path)?;
+    relaunch_guard.disarm();
     println!("→ Cursor proxy listening on http://{addr}");
     println!("→ Official Cursor launched; GPT routing discovery is active.");
     println!("→ Other Cursor traffic is passed through without inspection.");
@@ -1085,18 +1090,66 @@ fn require_official_cursor() -> Result<()> {
     }
 }
 
-fn require_cursor_stopped() -> Result<()> {
-    let running = Command::new("pgrep")
+fn cursor_is_running() -> bool {
+    Command::new("pgrep")
         .args(["-x", "Cursor"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .map(|status| status.success())
-        .unwrap_or(false);
-    if running {
-        bail!("quit all Cursor windows before running `opensub cursor proxy`");
+        .unwrap_or(false)
+}
+
+fn stop_cursor_if_running() -> Result<bool> {
+    if !cursor_is_running() {
+        return Ok(false);
     }
-    Ok(())
+
+    println!("→ Restarting Cursor to activate traffic capture…");
+    let status = Command::new("osascript")
+        .args(["-e", "tell application \"Cursor\" to quit"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("failed to request a graceful Cursor restart")?;
+    if !status.success() {
+        bail!("Cursor refused the restart request; quit it once and retry");
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while cursor_is_running() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    if cursor_is_running() {
+        bail!("Cursor did not finish closing within 30 seconds");
+    }
+    Ok(true)
+}
+
+struct CursorRelaunchGuard {
+    cursor_was_running: bool,
+    cert_path: PathBuf,
+}
+
+impl CursorRelaunchGuard {
+    fn new(cursor_was_running: bool, cert_path: PathBuf) -> Self {
+        Self {
+            cursor_was_running,
+            cert_path,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.cursor_was_running = false;
+    }
+}
+
+impl Drop for CursorRelaunchGuard {
+    fn drop(&mut self) {
+        if self.cursor_was_running {
+            let _ = launch_cursor_direct(&self.cert_path);
+        }
+    }
 }
 
 async fn shutdown_signal() {

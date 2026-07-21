@@ -58,7 +58,7 @@ opensub login
 Opens a browser for the ChatGPT OAuth flow. Tokens are stored at
 `~/.opensub/auth.json` (mode `0600`).
 
-### 3. Quit Cursor and start selective routing
+### 3. Start selective routing
 
 ```bash
 opensub cursor proxy
@@ -71,6 +71,9 @@ OpenSub launches the official Cursor and prints only route metadata:
 → Official Cursor launched; only Cursor processes are captured.
 → Non-Cursor applications are not routed through OpenSub.
 ```
+
+If Cursor is already open, OpenSub closes it gracefully and reopens it after
+the capture is ready. You do not need to manage that restart manually.
 
 The first run may ask macOS to approve mitmproxy's network extension and trust
 OpenSub's local certificate. Press `Ctrl-C` to stop routing.
@@ -109,7 +112,7 @@ Cursor currently applies an enabled OpenAI BYOK configuration to models that
 are not Claude or Gemini. That means explicitly selected Cursor models such as
 Composer and Grok can incorrectly receive the OpenSub credentials and fail.
 
-Run the process-level proxy with Cursor fully closed:
+Run the process-level proxy. OpenSub restarts Cursor automatically if needed:
 
 | Model family | Route |
 |---|---|
@@ -232,10 +235,10 @@ Cursor blocks private addresses. Start with `opensub serve --tunnel` and use the
 `https://*.trycloudflare.com` URL (with `/v1`) as the base URL.
 
 ### Tools don't execute / Cursor talks about edits instead of editing
-For `opensub cursor proxy`, reinstall the current source and restart Cursor
-through the proxy. The transparent bridge streams both sides of the bidirectional
-Agent request and uses Cursor's native `ExecServerMessage` shapes for workspace
-tools.
+For `opensub cursor proxy`, reinstall the current source and run the proxy
+again. It restarts Cursor automatically. The transparent bridge streams both
+sides of the bidirectional Agent request and uses Cursor's native
+`ExecServerMessage` shapes for workspace tools.
 
 ```bash
 cargo install --path . --force
@@ -251,9 +254,10 @@ For the OpenAI-compatible `serve` mode, Responses-shaped custom tools and
 responsible for executing returned tools.
 
 ### Cursor reports `Network disconnected` or `ERR_CERT_AUTHORITY_INVALID`
-Quit Cursor and restart `opensub cursor proxy`. OpenSub now verifies that its
-exact local CA is present in the login Keychain and has user trust settings;
-certificate presence alone is not treated as sufficient.
+Restart `opensub cursor proxy`; it handles the Cursor restart automatically.
+OpenSub verifies that its exact local CA is present in the login Keychain and
+has user trust settings; certificate presence alone is not treated as
+sufficient.
 
 ### `tools[7]: missing field function`
 Fixed — OpenSub accepts any tool shape. In Responses-shaped Cursor requests, it
