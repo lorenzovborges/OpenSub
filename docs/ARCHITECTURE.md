@@ -20,43 +20,59 @@ this when modifying the translation logic, the auth flow, or the streaming layer
 
 ## 1. High-level data flow
 
+OpenSub has two independent ingress modes. The transparent Cursor bridge is the
+recommended Cursor integration; the OpenAI-compatible HTTP API remains useful
+for other clients.
+
+### Transparent Cursor mode (recommended on macOS)
+
+```text
+Official Cursor process
+        |
+        | HTTPS /agent.v1.AgentService/Run
+        v
+mitmproxy Local Capture (Cursor process filter, one intercepted path)
+        |
+        | TLS/HTTP2 Connect stream + random bridge secret
+        v
+OpenSub Agent bridge
+        |
+        +-- minimal protobuf parse: requested model
+        |       |
+        |       +-- native/unknown model -> byte-stream passthrough -> Cursor
+        |       |
+        |       `-- OpenAI-family model -> full Agent parse
+        |                                  |
+        |                                  v
+        |                       Responses request/tool loop
+        |                                  |
+        v                                  v
+Cursor local tool executor <------> ChatGPT Codex backend
 ```
-┌────────┐ POST /v1/chat/completions            ┌──────────────────────┐
-│ Cursor │ ───────────────────────────────────► │  (Cloudflare tunnel) │
-│ (cloud)│  Authorization: Bearer <api key>      │  *.trycloudflare.com │
-└────────┘                                       └─────────┬────────────┘
-                                                           │ http → localhost:8788
-                                                           ▼
-                                                ┌──────────────────────┐
-                                                │  OpenSub (axum)      │
-                                                │                      │
-                          ┌─────────────────────┤  1. API-key check     │
-                          │                     │  2. lazy token refresh│
-                          │                     │  3. request translate │
-                          │                     │  4. POST /responses   │
-                          ▼                     └─────────┬────────────┘
-                ┌─────────────────────┐                    │
-                │ translate::request  │  builds Responses  │
-                │ (ChatCompl→Respons) │ ◄──────────────────┘
-                └─────────────────────┘
-                                                           │
-                                                           ▼
-                                          ┌─────────────────────────────┐
-                                          │ chatgpt.com/backend-api/    │
-                                          │ codex/responses             │
-                                          │ Auth: Bearer <ChatGPT token>│
-                                          │ + chatgpt-account-id        │
-                                          │ + originator: codex_cli_rs  │
-                                          └──────────────┬──────────────┘
-                                                         │ SSE stream
-                                                         ▼
-                                          ┌─────────────────────────────┐
-                                          │ translate::stream           │
-                                          │ (Responses SSE → ChatCompl  │
-                                          │  SSE, incremental)          │
-                                          └──────────────┬──────────────┘
-                                                         │
- Cursor ◄──text/event-stream── tunnel ◄──────────────────┘
+
+This mode does not expose an HTTP API publicly and does not use the persisted
+OpenSub API key. The bridge listener is bound to loopback and authenticated by
+a random secret generated for each worker process.
+
+### OpenAI-compatible API mode (optional)
+
+```text
+OpenAI-compatible client
+        |
+        | POST /v1/chat/completions + OpenSub API key
+        | optional Cloudflare quick tunnel
+        v
+OpenSub Axum API
+        |
+        +-- API-key middleware
+        +-- lazy ChatGPT token refresh
+        +-- Chat/Responses request normalization
+        v
+chatgpt.com/backend-api/codex/responses
+        |
+        | Responses SSE
+        v
+incremental Chat Completions SSE translation -> client
 ```
 
 ---
@@ -243,9 +259,10 @@ whole response. Two reasons:
 
 ## 7. Access control & the public tunnel
 
-Because Cursor runs server-side and blocks private networks, OpenSub must be
-publicly reachable. A public endpoint with no auth would let anyone drain your
-subscription, so **every route passes through `require_api_key` middleware**.
+This section applies to `opensub serve`, not to the transparent Cursor bridge.
+Some remote clients block private networks and therefore require a public URL.
+A public endpoint with no authentication could drain the user's subscription,
+so every HTTP API route passes through `require_api_key` middleware.
 
 - The key is `config::api_key()`: from `OPENSUB_API_KEY` env, or
   `~/.opensub/api_key` file (auto-generated `sk-opensub-<24 random bytes>` on
@@ -297,6 +314,12 @@ bundled.)
   requests preserve tools as-is, including custom/freeform tools. Only the
   legacy `messages[]` translation path drops non-`function` tools.
 - **Quick tunnel ephemeral.** URL rotates each restart.
+- **Transparent mode is macOS-only.** It requires mitmproxy Local Capture and
+  the official `/Applications/Cursor.app` bundle.
+- **Cursor's Agent protocol is internal.** Cursor updates can change protobuf
+  fields, Connect framing, or tool shapes and require an OpenSub update.
+- **Unknown OpenAI IDs fall back to `gpt-5.5`.** Set
+  `OPENSUB_CURSOR_MODEL` when deterministic upstream selection is required.
 - **Conversation history is partial in transparent mode.** The bridge consumes
   the current prompt and blobs prefetched in the initial Run request. It does
   not actively fetch every referenced KV blob, so older turns omitted from the
@@ -325,11 +348,13 @@ second command invocation leaves healthy processes untouched. If Cursor is
 already open during first installation, only Electron's network service is
 restarted after capture becomes ready; the editor window remains open.
 
-The plist, worker state, and service logs use mode `0600`. The LaunchAgent
-contains paths and non-secret configuration only; OAuth tokens remain in
-`~/.opensub/auth.json`. `opensub cursor stop` unloads it, while
-`opensub cursor uninstall` removes the plist and service logs without deleting
-OAuth state or the local CA.
+The plist, worker state, and service logs use mode `0600`. Logs larger than
+1 MiB are reset when the worker starts, preventing repeated service restarts
+from growing them indefinitely. The LaunchAgent contains paths and non-secret
+configuration only; OAuth tokens remain in `~/.opensub/auth.json`. `opensub
+cursor stop` unloads and disables it until an explicit `opensub cursor proxy`,
+while `opensub cursor uninstall` removes the plist and service logs without
+deleting OAuth state or the local CA.
 
 At the default `INFO` level, request output is emitted only after the bridge has
 decoded an OpenAI model and committed the request to the OpenSub route. Native
@@ -345,19 +370,22 @@ The private key and generated capture files stay under
 `~/.opensub/cursor-proxy` with restrictive permissions.
 
 The Rust bridge reads the first Connect envelope incrementally, decompresses
-gzip when requested by the envelope flags, and parses only the protobuf fields
-needed to select a route:
+gzip when requested by the envelope flags, and first parses only the run
+request and requested-model fields needed to select a route:
 
 | Requested model | Destination |
 |---|---|
-| `gpt-*`, `o*`, `*codex*` | ChatGPT Codex Responses backend |
+| `gpt-*`, `chatgpt-*`, `o1`-`o9*`, `*codex*` | ChatGPT Codex Responses backend |
 | Composer, Grok, Claude, Gemini, unknown/future models | Original Cursor backend |
 
-Native requests and responses remain byte streams; they are not buffered. GPT
-requests are translated into Responses input. The addon enables streaming for
-both halves of `AgentService/Run`; response buffering would deadlock a tool turn
-because OpenSub waits for an `ExecClientMessage` while Cursor waits to receive
-the corresponding `ExecServerMessage`.
+Native requests return to Cursor before OpenSub attempts to decode the action
+oneof. This is important because internal native-model actions are not always
+user-message actions. Their requests and responses remain byte streams and are
+not buffered. OpenAI-family requests proceed to the full parser and are
+translated into Responses input. The addon enables streaming for both halves
+of `AgentService/Run`; response buffering would deadlock a tool turn because
+OpenSub waits for an `ExecClientMessage` while Cursor waits to receive the
+corresponding `ExecServerMessage`.
 
 Prefetched conversation blobs are folded into the Responses input, MCP
 definitions become Responses function tools, and core workspace operations

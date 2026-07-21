@@ -9,9 +9,10 @@
 
 ## TL;DR for the next agent
 
-OpenSub is a **Rust single-binary OpenAI-compatible proxy** that lets Cursor use
-your ChatGPT (Plus/Pro) **subscription** as if it were an OpenAI API key. It
-works by:
+OpenSub is a **Rust proxy and protocol bridge** that lets Cursor use a ChatGPT
+(Plus/Pro) **subscription** for OpenAI-family models without configuring an
+OpenAI API key. Transparent mode uses the OpenSub binary plus the external
+mitmproxy Local Capture runtime. It works by:
 
 1. Logging you in with the same ChatGPT OAuth flow OpenCode uses (`opensub login`).
 2. Transparently intercepting the official Cursor Agent stream with
@@ -37,9 +38,9 @@ the ChatGPT subscription.
 
 ### Identity choice: "be OpenCode"
 The user explicitly asked OpenSub to **present itself as OpenCode**
-(`sst/opencode`) — same OAuth client id, same User-Agent — because OpenCode is a
-permitted/known client, which lowers the risk of the account being flagged. We
-reverse-engineered opencode's exact auth flow (PKCE params, scopes, client id
+(`sst/opencode`) — same OAuth client id and OAuth User-Agent. This is a
+compatibility choice, not a guarantee about provider support, terms, or account
+risk. We reproduced opencode's auth flow (PKCE params, scopes, client id
 `app_EMoamEEZ73f0CkXaXp7hrann`, token/refresh shapes) from its source and the
 Codex CLI source. Details: `docs/ARCHITECTURE.md` §2.
 
@@ -92,6 +93,14 @@ auth** (middleware) so the now-public endpoint can't be abused.
 4. **mitmproxy buffered Agent responses.** This deadlocked tools: OpenSub waited
    for `ExecClientMessage` while Cursor waited for `ExecServerMessage`. The addon
    now streams both request and response halves of `AgentService/Run`.
+5. **Native internal actions were parsed as user messages.** Routing used to
+   run the full action parser before checking the requested model, producing
+   `Agent action is not a user message` for Grok/Composer control actions. The
+   bridge now parses the model first and returns native traffic to Cursor before
+   decoding the action oneof.
+6. **A stopped service could reactivate after binary replacement.** `cursor
+   stop` now unloads and disables the LaunchAgent persistently. An explicit
+   `cursor proxy` enables it again, and `cursor status` reports that policy.
 
 ---
 
@@ -125,6 +134,10 @@ auth** (middleware) so the now-public endpoint can't be abused.
   `grep`; every request received a matching result and the generation completed.
 - Local CA trust, HTTP/2 transport, bidirectional response streaming, and native
   Exec protobuf shapes are covered by startup checks and focused tests.
+- Native-model routing no longer requires the action to contain a user message.
+- `cursor stop` remains disabled across macOS logins until an explicit start.
+- Dependency cleanup reduced the release binary to approximately 4.1 MB; the
+  current suite contains 22 passing tests and Clippy passes with warnings denied.
 - The legacy managed Cursor copy and its hidden CLI commands were removed after
   the transparent bridge passed validation.
 - README + ARCHITECTURE docs.
@@ -133,6 +146,8 @@ auth** (middleware) so the now-public endpoint can't be abused.
 - Transparent mode currently uses the current prompt plus blobs prefetched by
   Cursor. Active fetching of every referenced historical KV blob is not yet
   implemented, so some older conversation context may be absent.
+- The latest native internal-action routing fix is covered by a focused unit
+  test but still needs a fresh live Cursor passthrough validation.
 
 ### ❌ Not done (future work)
 - Broader unit tests with recorded SSE fixtures.
@@ -144,20 +159,25 @@ auth** (middleware) so the now-public endpoint can't be abused.
 
 ## Immediate next steps (do these first)
 
-1. **Start the transparent proxy:**
+1. **Validate the checkout before protocol work:**
    ```bash
-   cd ~/CursorOpenSub
+   cargo fmt --check
+   cargo clippy --all-targets --all-features -- -D warnings
+   cargo test --all-targets --all-features
+   ```
+2. **For live validation only**, install and start the transparent proxy:
+   ```bash
+   brew install --cask mitmproxy
    cargo install --path . --locked --force
    opensub cursor proxy
    ```
-   The command installs/updates a per-user LaunchAgent and returns. If Cursor is
-   open, only its Electron network process is refreshed after capture is ready.
-   Leave Cursor's OpenAI API key and base URL overrides disabled.
-2. Use Cursor normally. For diagnosis, inspect the metadata-only
+   The command installs/updates a per-user LaunchAgent and returns. Leave
+   Cursor's OpenAI API key and base URL overrides disabled.
+3. Use Cursor normally. For diagnosis, inspect the metadata-only
    `~/.opensub/cursor-proxy/events.jsonl`; a healthy tool turn includes
    `route_opensub`, `tool_requested`, `tool_completed`, and
    `generation_completed`.
-3. Select Composer or Grok for a passthrough check. It should produce
+4. Select Composer or Grok for a passthrough check. It should produce
    `route_cursor` and continue using the Cursor subscription.
    Normal `INFO` output remains quiet for passthrough and prints only OpenAI
    requests routed to OpenSub, including the exact requested model.
@@ -169,8 +189,8 @@ auth** (middleware) so the now-public endpoint can't be abused.
 ```bash
 # build & install
 cd ~/CursorOpenSub
-cargo install --path . --locked
-brew install cloudflared   # for the tunnel
+brew install --cask mitmproxy
+cargo install --path . --locked --force
 
 # one-time login
 opensub login
@@ -182,17 +202,15 @@ opensub probe
 # installs/starts a per-user LaunchAgent and returns
 opensub cursor proxy
 
-# inspect or remove the background service
+# inspect, stop, or remove the background service
 opensub cursor status
+opensub cursor stop
 opensub cursor uninstall
 
 # optional OpenAI-compatible endpoint for other clients
+brew install cloudflared
 opensub serve --tunnel
 ```
-
-Sandbox note: this project was developed with a tool harness whose shell/filesystem
-occasionally went degraded mid-session (`spawn /bin/zsh ENOENT`). If a command
-mysteriously fails, retry — it's environmental, not the code.
 
 ---
 

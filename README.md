@@ -1,355 +1,425 @@
 # OpenSub
 
-A lightweight **selective Cursor proxy** and OpenAI-compatible API server that
-routes OpenAI models to the Codex backend using your **ChatGPT (Plus/Pro)
-subscription** — no OpenAI API key and no per-token API billing.
+OpenSub routes OpenAI-family models selected in the official Cursor app to the
+Codex backend using a ChatGPT Plus/Pro subscription. Composer, Grok, Claude,
+Gemini, and unknown model families continue to use Cursor normally.
 
-It mirrors the OpenAI API (`/v1/models`, `/v1/chat/completions`) so that tools
-like **Cursor** can use it as a drop-in OpenAI provider. Internally it accepts
-both legacy Chat Completions-shaped bodies and the Responses-shaped bodies
-Cursor sends on `/v1/chat/completions`, forwards them to the Codex backend, and
-translates the streaming response back to Chat Completions SSE. Authentication
-uses the same OAuth "Sign in with ChatGPT" flow the Codex CLI and OpenCode use.
+The recommended integration is a transparent, process-scoped proxy for macOS.
+It does not require an OpenAI API key, a custom base URL, a modified Cursor
+application, or a terminal that stays open.
 
-The recommended `cursor proxy` mode works with the official Cursor application
-without changing its API-key or base-URL settings. It translates Cursor's
-Connect/protobuf Agent stream, asks Cursor to execute tools locally, and sends
-only OpenAI-family model inference to Codex. Composer, Grok, Claude, Gemini, and
-other native models continue to use the Cursor subscription.
+OpenSub also provides an optional OpenAI-compatible HTTP server for other
+clients. That server exposes `/v1/models` and `/v1/chat/completions`, supports
+streaming, and can create a Cloudflare quick tunnel.
 
----
+> [!WARNING]
+> Transparent Cursor routing is experimental and depends on Cursor's internal
+> Agent protocol. Cursor updates can require a matching OpenSub update. Using a
+> ChatGPT subscription through a third-party client may also be restricted by
+> provider terms. Use this project only with accounts and machines you control.
 
-## How it works
+## Choose a mode
 
+| Mode | Intended use | API key | Public tunnel | Persistent |
+|---|---|---:|---:|---:|
+| `opensub cursor proxy` | Official Cursor on macOS | No | No | Yes, LaunchAgent |
+| `opensub serve` | Local OpenAI-compatible clients | Yes | No | No |
+| `opensub serve --tunnel` | Remote/cloud clients | Yes | Cloudflare quick tunnel | No |
+
+For Cursor, use `opensub cursor proxy` unless you specifically need the HTTP
+API. Do not combine transparent mode with Cursor's OpenAI API-key or base-URL
+overrides.
+
+## How transparent routing works
+
+```text
+Official Cursor -> mitmproxy Local Capture -> OpenSub bridge
+                                              |
+                     +------------------------+-----------------------+
+                     | requested model                                |
+             gpt-*, chatgpt-*, o*, *codex*                   everything else
+                     |                                                |
+          ChatGPT Codex Responses backend                    Cursor backend
+                     |                                                |
+                     +--------------- Agent stream -------------------+
 ```
- Official Cursor ──AgentService/Run──► OpenSub local process capture
-                                           │
-                     ┌─────────────────────┴─────────────────────┐
-                     │ requested model                           │
-                  gpt-*/o*/codex                         Composer/Grok/etc.
-                     │                                           │
-             Codex Responses API                         Cursor backend
-                     │                                           │
-                     └──────────── Agent stream ──────────────────┘
-```
 
-On macOS this uses mitmproxy Local Capture restricted to Cursor processes. It
-does not change the system proxy and does not route other applications through
-OpenSub. The separate `serve` mode remains available for OpenAI-compatible
-clients and supports an optional Cloudflare tunnel.
+Local Capture is restricted to Cursor processes, and the addon rewrites only
+`/agent.v1.AgentService/Run`. OpenSub does not configure a system-wide proxy and
+does not route other applications. The local bridge uses TLS/HTTP/2 and a
+random per-process secret.
 
----
+For OpenAI-family requests, OpenSub translates Cursor's Connect/protobuf Agent
+stream to the Codex Responses protocol. Cursor still executes workspace tools
+locally. Native model traffic is passed through as a byte stream to Cursor.
 
-## Quick start
+## Requirements
 
-### 1. Build & install
+Transparent Cursor mode requires:
+
+- macOS and the official `/Applications/Cursor.app` installation.
+- A ChatGPT Plus/Pro account for Codex inference.
+- Rust 1.85 or newer and Cargo.
+- [Homebrew](https://brew.sh/) and mitmproxy.
+
+The optional tunnel mode additionally requires `cloudflared`.
+
+## Install
 
 ```bash
-cargo install --path . --locked
+git clone https://github.com/lorenzovborges/OpenSub.git
+cd OpenSub
+
 brew install --cask mitmproxy
+cargo install --path . --locked
 ```
 
-### 2. Log in with ChatGPT (once)
+Then authenticate once:
 
 ```bash
 opensub login
 ```
 
-Opens a browser for the ChatGPT OAuth flow. Tokens are stored at
-`~/.opensub/auth.json` (mode `0600`).
+The browser-based OAuth flow stores tokens in `~/.opensub/auth.json` with mode
+`0600`.
 
-### 3. Start selective routing
+## Start Cursor routing
 
 ```bash
 opensub cursor proxy
 ```
 
-OpenSub installs and starts a per-user macOS LaunchAgent:
+On first use, macOS may ask you to approve mitmproxy's network extension and
+trust the local `OpenSub Cursor Proxy` certificate. OpenSub then installs and
+starts this per-user LaunchAgent:
 
-```
-→ Cursor proxy service: installed and active
-→ Starts automatically at login.
-→ No terminal needs to stay open.
-```
-
-Operational output records only OpenAI requests actually intercepted by
-OpenSub, including the model selected in Cursor. Composer, Grok, telemetry, and
-other passthrough traffic stay silent at the default log level.
-
-If Cursor is already open, OpenSub refreshes only Electron's network process
-after the capture is ready. The editor window and workspace remain open.
-
-The first run may ask macOS to approve mitmproxy's network extension and trust
-OpenSub's local certificate. Later logins start routing automatically before
-you open Cursor.
-
-### 4. Use Cursor normally
-
-Do not enable a custom OpenAI API key and do not override the OpenAI base URL.
-Select an OpenAI model to use the ChatGPT subscription through OpenSub, or
-select Composer/Grok/etc. to use the Cursor subscription unchanged.
-
-Then send a message in chat / agent mode.
-
----
-
-## Commands
-
-```
-opensub                 # login if not logged in, otherwise serve (no tunnel)
-opensub login           # sign in with ChatGPT (browser OAuth)
-opensub logout          # delete stored tokens
-opensub key             # print your API key
-opensub key rotate      # generate and persist a new API key
-opensub cursor proxy    # install/start persistent selective Cursor routing
-opensub cursor status   # show LaunchAgent health
-opensub cursor stop     # stop routing until restarted or the next login
-opensub cursor uninstall # remove the LaunchAgent (keeps OAuth and local CA)
-opensub cursor proxy --capture-protocol # diagnostic: capture and block one Agent request
-opensub probe           # debug: send a minimal request to the upstream
-opensub serve           # start the API server (localhost only)
-opensub serve --tunnel  # start server + Cloudflare quick tunnel (for Cursor)
-opensub serve --port 9000 --host 127.0.0.1
+```text
+~/Library/LaunchAgents/com.opensub.cursor-proxy.plist
 ```
 
----
+The command returns after the worker is ready. No terminal needs to remain
+open. If Cursor is already running, OpenSub refreshes its network process; if
+that is not possible, Cursor is relaunched.
 
-## Keep Cursor models while routing GPT to OpenSub (macOS)
+Check the state:
 
-Cursor currently applies an enabled OpenAI BYOK configuration to models that
-are not Claude or Gemini. That means explicitly selected Cursor models such as
-Composer and Grok can incorrectly receive the OpenSub credentials and fail.
+```bash
+opensub cursor status
+```
 
-Run the process-level proxy once. It remains active across logins:
+In Cursor:
 
-| Model family | Route |
+1. Leave the custom OpenAI API key disabled.
+2. Leave the OpenAI base URL unchanged.
+3. Select a model and use Chat or Agent normally.
+
+### Model routing
+
+| Cursor model ID | Destination |
 |---|---|
-| `gpt-*`, `o*`, `*codex*` | OpenSub / ChatGPT Codex backend |
-| `claude-*`, `gemini-*` | Cursor subscription |
-| Composer, Grok, Kimi, GLM, other models | Cursor subscription |
+| `gpt-*`, `chatgpt-*`, `o1`-`o9*`, `*codex*` | OpenSub / ChatGPT Codex backend |
+| Composer, Grok, Claude, Gemini, Kimi, GLM, unknown models | Cursor backend |
+
+Recognized Codex model IDs are preserved when possible. Unknown OpenAI-family
+IDs fall back to `gpt-5.5`. Set `OPENSUB_CURSOR_MODEL` before running
+`opensub cursor proxy` to force a specific upstream model.
+
+## Service lifecycle
+
+| Action | Command | Result |
+|---|---|---|
+| Install, update, or start | `opensub cursor proxy` | Enables and starts the LaunchAgent |
+| Inspect | `opensub cursor status` | Reports active, starting, stopped, or not installed |
+| Stop | `opensub cursor stop` | Stops and disables it across future macOS logins |
+| Start again | `opensub cursor proxy` | Re-enables and starts it |
+| Uninstall service | `opensub cursor uninstall` | Removes plist and service logs; keeps OAuth and local CA |
+
+While enabled, the LaunchAgent starts automatically when the user logs in and
+restarts the worker if it exits. `cursor stop` is persistent: the service stays
+disabled until another explicit `cursor proxy` command.
+
+## Update
+
+From the cloned repository:
 
 ```bash
+git pull --ff-only
+cargo install --path . --locked --force
 opensub cursor proxy
 ```
 
-The official `/Applications/Cursor.app` is launched without modification and
-keeps its normal updater. OpenSub does not create a second Cursor app or patch
-the installed application bundle.
-
----
-
-## Configuration (environment variables)
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `OPENSUB_HOST` | `127.0.0.1` | Bind address |
-| `OPENSUB_PORT` | `8788` | Bind port |
-| `OPENSUB_API_KEY` | *(auto-generated)* | The key clients must present. If unset, one is generated and persisted to `~/.opensub/api_key` |
-| `OPENSUB_UPSTREAM` | `https://chatgpt.com/backend-api/codex` | Inference upstream base URL |
-| `OPENSUB_ALLOW_CUSTOM_UPSTREAM` | *(unset)* | Set to `1` only when you intentionally want to send your OAuth token to a custom `OPENSUB_UPSTREAM` |
-| `OPENSUB_HOME` | `~/.opensub` | Data directory (tokens, api key) |
-| `OPENSUB_USER_AGENT_VERSION` | `local` | Version in the `opencode/<v>` User-Agent |
-| `OPENSUB_CURSOR_MODEL` | *(automatic)* | Override the Codex model used for intercepted Cursor OpenAI model IDs |
-| `RUST_LOG` | `opensub=info` | Log level |
-
----
-
-## Authentication & identity
-
-OpenSub presents itself as **OpenCode** to OpenAI's auth server — the same
-OAuth flow and client id that the [`sst/opencode`](https://github.com/sst/opencode)
-project uses:
-
-- **OAuth flow:** PKCE (S256), scopes `openid profile email offline_access`
-- **Client ID:** `app_EMoamEEZ73f0CkXaXp7hrann` *(OpenCode's public client id)*
-- **Callback:** `http://localhost:1455/auth/callback`
-- **User-Agent on auth requests:** `opencode/<version>`
-
-The resulting access token works against the **ChatGPT/Codex backend**
-(`chatgpt.com/backend-api/codex/responses`), not the public
-`api.openai.com/v1/responses` (which requires an API-key scope that the
-subscription token lacks — the public endpoint returns 401 with
-`Missing scopes: api.responses.write`).
-
-### Server-side access control
-
-Because the server is exposed via a public tunnel, **OpenSub enforces an API
-key** on every request. The key is auto-generated on first run (or set via
-`OPENSUB_API_KEY`). Without a valid key, requests get `401`. This prevents
-anyone with the tunnel URL from draining your subscription.
-
-Rotate the persisted key anytime with:
+The last command updates the LaunchAgent configuration and restarts the worker
+with the new binary. To update while keeping routing stopped:
 
 ```bash
+opensub cursor stop
+cargo install --path . --locked --force
+```
+
+## Optional OpenAI-compatible API
+
+Start a local server:
+
+```bash
+opensub serve
+```
+
+Default endpoint: `http://127.0.0.1:8788/v1`.
+
+For a client that cannot reach localhost:
+
+```bash
+brew install cloudflared
+opensub serve --tunnel
+```
+
+OpenSub prints a temporary `https://*.trycloudflare.com/v1` base URL and an API
+key. Quick-tunnel URLs change whenever the command restarts. A stable named
+Cloudflare tunnel is not managed by OpenSub.
+
+Every HTTP API route requires either:
+
+```http
+Authorization: Bearer <opensub-api-key>
+```
+
+or:
+
+```http
+x-api-key: <opensub-api-key>
+```
+
+Inspect or rotate the persisted key:
+
+```bash
+opensub key
 opensub key rotate
 ```
 
-Then update Cursor's OpenAI API Key field and restart any running OpenSub
-server. If `OPENSUB_API_KEY` is set, that environment value takes precedence and
-must be changed directly.
+API-key rotation affects only `serve` mode. Transparent Cursor routing uses its
+own random loopback secret and does not use this API key.
 
----
+## Commands
 
-## API reference
+```text
+opensub                         Login when unauthenticated; otherwise serve locally
+opensub login                   Sign in with ChatGPT in a browser
+opensub logout                  Delete stored OAuth tokens
+opensub probe                   Send a minimal Codex request for diagnosis
 
-OpenSub exposes an OpenAI-compatible API:
+opensub cursor proxy            Install/update/start transparent routing
+opensub cursor status           Show LaunchAgent health and policy
+opensub cursor stop             Stop and disable transparent routing
+opensub cursor uninstall        Remove the LaunchAgent and service logs
+
+opensub key                     Show the HTTP API key
+opensub key rotate              Rotate the persisted HTTP API key
+opensub serve                   Start the local OpenAI-compatible server
+opensub serve --tunnel          Start the server and a Cloudflare quick tunnel
+```
+
+`opensub cursor proxy --capture-protocol` is a developer diagnostic. It stores
+the next Agent request locally, blocks that request from reaching Cursor, and
+may capture prompt context. Do not use it during normal operation or share the
+result.
+
+## Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `OPENSUB_HOME` | `~/.opensub` | Token, key, CA, state, and log directory |
+| `OPENSUB_UPSTREAM` | `https://chatgpt.com/backend-api/codex` | Inference upstream base URL |
+| `OPENSUB_ALLOW_CUSTOM_UPSTREAM` | unset | Explicitly allow a custom upstream to receive the OAuth token |
+| `OPENSUB_USER_AGENT_VERSION` | `local` | Version in the OAuth `opencode/<version>` User-Agent |
+| `OPENSUB_CURSOR_MODEL` | automatic | Force intercepted Cursor requests to one Codex model |
+| `OPENSUB_MITMDUMP` | auto-detected | Override the `mitmdump` executable path |
+| `OPENSUB_HOST` | `127.0.0.1` | HTTP API bind address |
+| `OPENSUB_PORT` | `8788` | HTTP API bind port |
+| `OPENSUB_API_KEY` | generated file | Override the HTTP API key; takes precedence over the persisted key |
+| `RUST_LOG` | `info` | Global level or `opensub=<level>`: `off`, `error`, `warn`, `info`, `debug`, `trace` |
+
+Environment values used by the LaunchAgent are captured when
+`opensub cursor proxy` installs or updates its plist. Run that command again
+after changing a proxy-related variable.
+
+## HTTP API
 
 ### `GET /v1/models`
-Returns the static list of models (configurable in `src/config.rs`).
+
+Returns the static model list from `src/config.rs`. `/models` is an alias.
 
 ### `POST /v1/chat/completions`
-OpenSub accepts both standard OpenAI Chat Completions bodies and
-Responses-shaped bodies that Cursor may send on this path. Both `stream: true`
-and `stream: false` are supported (non-streaming is internally buffered — the
-Codex backend mandates `stream: true` upstream).
 
-#### Request handling details
+`/chat/completions` is an alias. The endpoint accepts:
 
-- `input[]` present: sanitize and pass through as a Responses request,
-  preserving Cursor custom/freeform tools such as `ApplyPatch`.
-- `messages[]` present: translate legacy Chat Completions messages into a
-  Responses request.
+- Standard Chat Completions requests containing `messages[]`.
+- Responses-shaped requests containing `input[]`, as sent by some clients on
+  the Chat Completions path.
 
-Both paths force `stream:true`, `store:false`, include
-`reasoning.encrypted_content`, default `parallel_tool_calls:true`, and keep
-`prompt_cache_key` aligned with the `session_id` header.
+Both `stream: true` and `stream: false` are accepted. OpenSub always uses
+streaming upstream because the Codex backend requires it; non-streaming client
+responses are assembled locally.
 
-#### Legacy translation details (Chat Completions → Responses)
+Responses-shaped requests preserve custom/freeform tools. Legacy
+Chat Completions requests translate `function` tools and ignore unsupported
+non-function tool shapes.
 
-| Chat Completions | Responses |
-|---|---|
-| `messages[role=system]` | `instructions` (concatenated) |
-| `messages[role=user]` | `input[] message / input_text` |
-| `messages[role=assistant]` | `input[] message / output_text` |
-| `messages[role=assistant].tool_calls` | `input[] function_call` |
-| `messages[role=tool]` | `input[] function_call_output` |
-| `tools[].function` | `tools[] {type:"function", name, description, parameters}` |
-| — | `store:false`, `tool_choice:"auto"` (defaults) |
+See [Architecture](docs/ARCHITECTURE.md) for the complete request, tool, and SSE
+event mappings.
 
-For legacy `messages[]` requests, non-`function` tools are dropped. For
-Responses-shaped Cursor requests, tool definitions are preserved so
-custom/freeform tools can round-trip through the Codex backend.
+## Authentication and local data
 
-### Path aliases
-Routes are also served **without** the `/v1` prefix (`/models`,
-`/chat/completions`) for client compatibility.
+OpenSub uses browser OAuth with PKCE and the public OpenCode client identity.
+The resulting ChatGPT OAuth token is sent to the ChatGPT Codex backend, not to
+the public `api.openai.com/v1/responses` endpoint.
 
----
+| Path | Contents | Mode |
+|---|---|---:|
+| `~/.opensub/auth.json` | OAuth access, refresh, and ID tokens | `0600` |
+| `~/.opensub/api_key` | HTTP API key for `serve` mode | `0600` |
+| `~/.opensub/cursor-proxy/` | Local CA key, addon, state, metadata logs | directory `0700`; files `0600` |
+| `~/Library/LaunchAgents/com.opensub.cursor-proxy.plist` | Worker command and non-secret environment | `0600` |
+
+The transparent proxy installs a trusted local CA in the user's login
+Keychain. Capture is process/path scoped, but possession of any trusted CA
+private key is security-sensitive. Do not copy or share files from
+`~/.opensub/cursor-proxy`.
+
+OpenSub logs routing and lifecycle metadata only. It does not intentionally log
+prompts, OAuth tokens, Cursor authorization headers, tool arguments, tool
+outputs, or fetched blob contents. Diagnostic protocol captures are the
+exception and can contain prompt data.
+
+Read [SECURITY.md](SECURITY.md) before exposing the HTTP API or reporting a
+vulnerability.
 
 ## Troubleshooting
 
-### `Access to private networks is forbidden`
-Cursor blocks private addresses. Start with `opensub serve --tunnel` and use the
-`https://*.trycloudflare.com` URL (with `/v1`) as the base URL.
+### Verify routing
 
-### Tools don't execute / Cursor talks about edits instead of editing
-For `opensub cursor proxy`, reinstall the current source and run the command
-again. It updates and restarts the background service when the binary changes.
-The transparent bridge streams both sides of the bidirectional Agent request and uses Cursor's native
-`ExecServerMessage` shapes for workspace tools.
+```bash
+opensub cursor status
+tail -f ~/.opensub/cursor-proxy/events.jsonl
+```
+
+An intercepted OpenAI turn records `route_opensub`; a native-model turn records
+`route_cursor`. Tool turns additionally record `tool_requested`,
+`tool_completed`, and `generation_completed`.
+
+### Cursor uses its own quota for a GPT model
+
+Confirm that transparent routing is active and that Cursor's custom OpenAI API
+key/base URL are disabled. Then update and restart OpenSub:
 
 ```bash
 cargo install --path . --locked --force
 opensub cursor proxy
 ```
 
-Metadata-only lifecycle events are written to
-`~/.opensub/cursor-proxy/events.jsonl`. A healthy tool turn contains
-`route_opensub`, `tool_requested`, `tool_completed`, and `generation_completed`.
+### Composer or Grok fails with `Agent action is not a user message`
 
-For the OpenAI-compatible `serve` mode, Responses-shaped custom tools and
-`custom_tool_call` stream events are preserved, but the client remains
-responsible for executing returned tools.
+Update OpenSub. Older builds fully decoded every Agent action before selecting
+the route. Current builds inspect the model first and pass native actions
+through without requiring a user-message shape.
 
-### Cursor reports `Network disconnected` or `ERR_CERT_AUTHORITY_INVALID`
-Run `opensub cursor proxy` again. OpenSub verifies that its exact local CA is
-present in the login Keychain and has user trust settings; certificate presence
-alone is not treated as sufficient. Use `opensub cursor status` to verify the
-LaunchAgent state.
+### Tools are described but not executed
 
-### `tools[7]: missing field function`
-Fixed — OpenSub accepts any tool shape. In Responses-shaped Cursor requests, it
-preserves custom tools; in legacy Chat-shaped requests, it forwards only
-`function` tools.
+Inspect `events.jsonl`. A healthy tool turn has both `tool_requested` and
+`tool_completed`. Reinstall and restart if the installed binary is stale:
 
-### `broken pipe` / cloudflared `Unable to reach the origin service`
-Was caused by buffering the entire upstream response before sending. Fixed —
-OpenSub now streams frames incrementally.
+```bash
+cargo install --path . --locked --force
+opensub cursor proxy
+```
 
-### `401 Unauthorized` from upstream with `Missing scopes`
-Means the upstream is set to `api.openai.com/v1` (public Responses endpoint),
-which the subscription token can't access. Use the default
-`chatgpt.com/backend-api/codex` upstream instead.
+### `Network disconnected` or `ERR_CERT_AUTHORITY_INVALID`
+
+Run `opensub cursor proxy` again. OpenSub verifies the exact local CA
+fingerprint and its user trust settings. If startup still fails, inspect:
+
+```bash
+tail -n 100 ~/.opensub/cursor-proxy/service-error.log
+tail -n 100 ~/.opensub/cursor-proxy/service.log
+```
+
+### `Access to private networks is forbidden`
+
+This applies to `serve` mode when the client runs remotely. Use
+`opensub serve --tunnel` and configure the printed HTTPS `/v1` URL. Transparent
+`cursor proxy` mode does not need a public URL.
+
+### `401 Missing scopes: api.responses.write`
+
+The OAuth subscription token was sent to the public OpenAI API. Remove the
+`OPENSUB_UPSTREAM` override or use the default ChatGPT Codex backend.
 
 ### `refusing to send OAuth token to unsupported OPENSUB_UPSTREAM host`
-OpenSub only sends your ChatGPT OAuth token to `chatgpt.com` or
-`api.openai.com` by default. If you are intentionally testing a trusted custom
-proxy, set `OPENSUB_ALLOW_CUSTOM_UPSTREAM=1`.
 
-### `400 Stream must be set to true`
-The Codex backend mandates streaming. OpenSub always streams upstream now and
-buffers for non-streaming clients — you shouldn't see this from Cursor.
+OpenSub only allows HTTPS `chatgpt.com` and `api.openai.com` upstreams by
+default. Set `OPENSUB_ALLOW_CUSTOM_UPSTREAM=1` only for an upstream you fully
+trust, because it receives your OAuth bearer token.
 
----
+### Historical warnings remain in the logs
+
+Service logs persist across updates. Stop routing before clearing them:
+
+```bash
+opensub cursor stop
+: > ~/.opensub/cursor-proxy/service.log
+: > ~/.opensub/cursor-proxy/service-error.log
+```
+
+## Remove OpenSub
+
+Remove the service and OAuth tokens:
+
+```bash
+opensub cursor uninstall
+opensub logout
+```
+
+To also remove the trusted CA, local state, API key, and binary:
+
+```bash
+security delete-certificate -c "OpenSub Cursor Proxy" \
+  ~/Library/Keychains/login.keychain-db
+rm -rf ~/.opensub
+cargo uninstall opensub
+```
+
+`cursor uninstall` intentionally keeps the OAuth login and local CA so that a
+later reinstall does not require authorization and certificate setup again.
+
+## Development
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+cargo audit
+cargo build --release
+```
+
+The release profile enables stripping, LTO, abort-on-panic, and one codegen unit.
+See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request and read
+[Architecture](docs/ARCHITECTURE.md) before changing routing, streaming, or
+protobuf translation.
 
 ## Project layout
 
-```
+```text
 src/
-├── main.rs             # CLI (login/logout/key/probe/serve), tunnel spawn
-├── config.rs           # constants (client_id, URLs), env vars, model list
-├── auth/
-│   ├── mod.rs          # login(), ensure_valid_token() (lazy refresh), logout()
-│   ├── oauth.rs        # PKCE, authorize URL, code exchange, refresh
-│   ├── callback.rs     # ephemeral axum server on :1455 for OAuth redirect
-│   └── store.rs        # ~/.opensub/auth.json (0600), JWT parsing for exp/account_id
-├── api/
-│   ├── mod.rs          # router, API-key middleware, chat_completions handler
-│   └── models.rs       # GET /v1/models
-├── codex/
-│   └── client.rs       # POST {upstream}/responses → ByteStream, probe()
-├── cursor_agent.rs     # Cursor Connect/protobuf bridge, tools, blobs, routing
-├── cursor_proxy.rs     # macOS process capture and native-model passthrough
-├── translate/
-│   ├── request.rs      # ChatCompletions → Responses
-│   └── stream.rs       # Responses SSE → ChatCompletions SSE (incremental streaming)
-└── types/
-    ├── chat.rs         # serde: Chat Completions request/chunk types
-    └── responses.rs    # serde: Responses request + SSE event struct
+|-- main.rs              CLI, API server, and Cloudflare process
+|-- config.rs            Identity constants, paths, environment, model list
+|-- auth/                 OAuth, callback server, token refresh and storage
+|-- api/                  OpenAI-compatible routes and API-key middleware
+|-- codex/client.rs       Shared Codex HTTP client and streaming request
+|-- cursor_agent.rs       Connect/protobuf routing and tool execution bridge
+|-- cursor_proxy.rs       LaunchAgent, Local Capture, TLS, CA, and lifecycle
+|-- translate/            Chat/Responses request and SSE translation
+`-- types/                API wire types
 ```
-
----
-
-## Notes & caveats
-
-- **Terms of Service:** Using a ChatGPT subscription outside the official
-  ChatGPT/Codex clients is a gray area. OpenSub is for **personal use**. The
-  risk of account action is the same as any third-party client reusing these
-  OAuth flows.
-- **Cursor Tab (autocomplete)** does not work with custom endpoints — that's a
-  Cursor limitation, not an OpenSub one. Chat and Agent modes work.
-- **Quick tunnels are ephemeral:** the `trycloudflare.com` URL changes on every
-  `opensub serve --tunnel` restart. For a stable URL, set up a named Cloudflare
-  tunnel (not yet bundled).
-- **Model availability** depends on your subscription tier; the list in
-  `config.rs` is just what's advertised to Cursor.
-- **Transparent Cursor routing is experimental and macOS-only.** Cursor protocol
-  updates may require a compatible OpenSub update.
-
----
-
-## Build
-
-```bash
-cargo build --release
-# binary: target/release/opensub
-```
-
-Release profile is configured with `strip`, `lto`, `panic = "abort"`, and
-`codegen-units = 1` for a small, optimized binary.
-
----
 
 ## License
 
-OpenSub is released under the [MIT License](LICENSE).
+OpenSub is available under the [MIT License](LICENSE).

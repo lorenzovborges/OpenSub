@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::LevelFilter;
 
 #[derive(Parser)]
 #[command(
@@ -83,7 +83,7 @@ enum CursorCommand {
     },
     /// Show whether persistent Cursor routing is installed and active.
     Status,
-    /// Stop Cursor routing until it is started again or the next login.
+    /// Stop Cursor routing until it is explicitly started again.
     Stop,
     /// Remove persistent Cursor routing from this macOS account.
     Uninstall,
@@ -95,9 +95,7 @@ enum CursorCommand {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("opensub=info")),
-        )
+        .with_max_level(configured_log_level())
         .with_target(false)
         .init();
 
@@ -121,6 +119,44 @@ async fn main() -> Result<()> {
             codex::client::probe(&tokens).await
         }
         Some(Command::Serve { port, host, tunnel }) => serve(port, host, tunnel).await,
+    }
+}
+
+fn configured_log_level() -> LevelFilter {
+    std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|value| parse_log_level(&value))
+        .unwrap_or(LevelFilter::INFO)
+}
+
+fn parse_log_level(value: &str) -> Option<LevelFilter> {
+    let mut global = None;
+    let mut opensub = None;
+    for directive in value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        if let Some((target, level)) = directive.split_once('=') {
+            if target.trim() == "opensub" {
+                opensub = parse_level_name(level);
+            }
+        } else {
+            global = parse_level_name(directive);
+        }
+    }
+    opensub.or(global)
+}
+
+fn parse_level_name(value: &str) -> Option<LevelFilter> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" => Some(LevelFilter::OFF),
+        "error" => Some(LevelFilter::ERROR),
+        "warn" => Some(LevelFilter::WARN),
+        "info" => Some(LevelFilter::INFO),
+        "debug" => Some(LevelFilter::DEBUG),
+        "trace" => Some(LevelFilter::TRACE),
+        _ => None,
     }
 }
 
@@ -379,5 +415,15 @@ mod tests {
             extract_trycloudflare_url("metrics server listening on http://127.0.0.1:8789")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn parses_simple_global_and_opensub_log_levels() {
+        assert_eq!(parse_log_level("warn"), Some(LevelFilter::WARN));
+        assert_eq!(
+            parse_log_level("warn,opensub=debug,hyper=error"),
+            Some(LevelFilter::DEBUG)
+        );
+        assert_eq!(parse_log_level("opensub=invalid"), None);
     }
 }

@@ -97,8 +97,7 @@ impl BridgeState {
 }
 
 struct EventLog {
-    path: PathBuf,
-    write_lock: Mutex<()>,
+    file: Mutex<std::fs::File>,
 }
 
 impl EventLog {
@@ -115,13 +114,12 @@ impl EventLog {
             .open(&path)?;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         Ok(Self {
-            path,
-            write_lock: Mutex::new(()),
+            file: Mutex::new(file),
         })
     }
 
     fn record(&self, event: &str, model: Option<&str>) {
-        let Ok(_guard) = self.write_lock.lock() else {
+        let Ok(mut file) = self.file.lock() else {
             return;
         };
         let timestamp_ms = SystemTime::now()
@@ -134,9 +132,7 @@ impl EventLog {
             "event": event,
             "model": model,
         });
-        if let Ok(mut file) = OpenOptions::new().append(true).open(&self.path) {
-            let _ = writeln!(file, "{line}");
-        }
+        let _ = writeln!(file, "{line}");
     }
 }
 
@@ -189,28 +185,29 @@ async fn route_request(state: BridgeState, request: Request) -> Result<Response>
 
     let frame = first_connect_frame(&initial)?.expect("checked above");
     let message = decode_connect_message(frame.flags, frame.payload)?;
-    let agent = AgentRequest::parse(&message)?;
+    let run = parse_agent_run(&message)?;
+    let (requested_model, reasoning_effort) = parse_requested_model(&run)?;
 
     if state.capture_protocol {
         write_protocol_capture(&message)?;
         state
             .events
-            .record("protocol_captured", Some(&agent.requested_model));
+            .record("protocol_captured", Some(&requested_model));
         println!("→ Agent protocol captured locally; upstream request blocked.");
         bail!("Agent protocol capture completed");
     }
 
-    if !is_openai_model(&agent.requested_model) {
-        state
-            .events
-            .record("route_cursor", Some(&agent.requested_model));
+    if !is_openai_model(&requested_model) {
+        state.events.record("route_cursor", Some(&requested_model));
         tracing::debug!(
-            model = %agent.requested_model,
+            model = %requested_model,
             host = %original_host,
             "Cursor Agent request routed to Cursor"
         );
         return passthrough(state, parts.headers, original_host, buffered, incoming).await;
     }
+
+    let agent = AgentRequest::parse(&run, requested_model, reasoning_effort)?;
 
     tracing::info!(
         model = %agent.requested_model,
@@ -1317,14 +1314,11 @@ struct AgentRequest {
 }
 
 impl AgentRequest {
-    fn parse(message: &[u8]) -> Result<Self> {
-        let client = WireMessage::parse(message)?;
-        let run = WireMessage::parse(
-            client
-                .bytes(1)
-                .ok_or_else(|| anyhow!("first Agent message is not a run request"))?,
-        )?;
-        let (requested_model, reasoning_effort) = parse_requested_model(&run)?;
+    fn parse(
+        run: &WireMessage<'_>,
+        requested_model: String,
+        reasoning_effort: Option<String>,
+    ) -> Result<Self> {
         let conversation_state = run
             .bytes(1)
             .map(WireMessage::parse)
@@ -1386,6 +1380,15 @@ impl AgentRequest {
             custom_system_prompt: run.string(8)?.map(str::to_string),
         })
     }
+}
+
+fn parse_agent_run(message: &[u8]) -> Result<WireMessage<'_>> {
+    let client = WireMessage::parse(message)?;
+    WireMessage::parse(
+        client
+            .bytes(1)
+            .ok_or_else(|| anyhow!("first Agent message is not a run request"))?,
+    )
 }
 
 fn parse_requested_model(run: &WireMessage<'_>) -> Result<(String, Option<String>)> {
@@ -1711,6 +1714,22 @@ mod tests {
         assert!(!is_openai_model("composer-2.5"));
         assert!(!is_openai_model("grok-4"));
         assert!(!is_openai_model("claude-4.5-opus"));
+    }
+
+    #[test]
+    fn native_model_routing_does_not_require_a_user_action() {
+        let requested_model = message(&[(1, b"grok-4.5")]);
+        let non_user_action = message(&[(2, b"internal-action")]);
+        let run_request = message(&[(2, &non_user_action), (9, &requested_model)]);
+        let client_message = message(&[(1, &run_request)]);
+
+        let run = parse_agent_run(&client_message).unwrap();
+        let (model, reasoning) = parse_requested_model(&run).unwrap();
+
+        assert_eq!(model, "grok-4.5");
+        assert_eq!(reasoning, None);
+        assert!(!is_openai_model(&model));
+        assert!(AgentRequest::parse(&run, model, reasoning).is_err());
     }
 
     #[test]

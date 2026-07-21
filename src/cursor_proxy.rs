@@ -3,10 +3,9 @@
 //! Only Cursor's agent hosts are decrypted. Everything else stays inside a
 //! normal CONNECT tunnel and is forwarded without inspection.
 
-use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -18,26 +17,22 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
-use http_body_util::BodyExt;
-use hudsucker::certificate_authority::RcgenAuthority;
-use hudsucker::hyper::{Request, Response};
-use hudsucker::rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    Issuer, KeyPair, KeyUsagePurpose,
+use rcgen::{
+    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
 };
-use hudsucker::rustls::{self, ServerConfig, crypto::aws_lc_rs};
-use hudsucker::{Body, HttpContext, HttpHandler, Proxy, RequestOrResponse};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{
+    TlsAcceptor,
+    rustls::{self, ServerConfig, crypto::ring},
+};
 
 use crate::config;
 
 const CURSOR_APP: &str = "/Applications/Cursor.app";
 const CA_CERT_NAME: &str = "cursor-proxy-ca.pem";
 const CA_KEY_NAME: &str = "cursor-proxy-ca-key.pem";
-const CURSOR_SETTINGS_BACKUP_NAME: &str = "cursor-settings-backup.json";
-const UNDICI_PRELOAD_NAME: &str = "undici-proxy-preload.cjs";
 const MITMPROXY_ADDON_NAME: &str = "opensub_capture.py";
 const UPSTREAM_CA_BUNDLE_NAME: &str = "upstream-ca-bundle.pem";
 const SERVICE_LABEL: &str = "com.opensub.cursor-proxy";
@@ -45,25 +40,17 @@ const SERVICE_PLIST_NAME: &str = "com.opensub.cursor-proxy.plist";
 const SERVICE_STATE_NAME: &str = "service-state.json";
 const SERVICE_LOG_NAME: &str = "service.log";
 const SERVICE_ERROR_LOG_NAME: &str = "service-error.log";
+const MAX_SERVICE_LOG_BYTES: u64 = 1024 * 1024;
 
 const MITMPROXY_ADDON: &str = r#"from mitmproxy import http
-import json
 import os
-import re
 
-CAPTURE = os.environ.get("OPENSUB_CAPTURE_PROTOCOL") == "1"
 BRIDGE_PORT = int(os.environ.get("OPENSUB_BRIDGE_PORT", "0"))
 BRIDGE_SECRET = os.environ.get("OPENSUB_BRIDGE_SECRET", "")
-MODEL_PATTERN = re.compile(br"gpt-[A-Za-z0-9_.-]+")
 
 
 def running() -> None:
     print("OPENSUB_READY", flush=True)
-
-
-def protocol_candidate(path: str) -> bool:
-    path = path.lower()
-    return "agent" in path or "composer" in path or ".aiservice/" in path
 
 
 def requestheaders(flow: http.HTTPFlow) -> None:
@@ -80,18 +67,6 @@ def requestheaders(flow: http.HTTPFlow) -> None:
     flow.request.port = BRIDGE_PORT
     flow.request.stream = True
 
-    print("OPENSUB_EVENT\t" + json.dumps({
-        "phase": "bridge",
-        "host": host,
-        "method": flow.request.method,
-        "path": flow.request.path,
-        "content_type": flow.request.headers.get("content-type", "unknown"),
-        "content_length": flow.request.headers.get("content-length", "stream"),
-        "http_version": flow.request.http_version,
-        "model": None,
-        "blocked": False,
-    }, separators=(",", ":")), flush=True)
-
 
 def responseheaders(flow: http.HTTPFlow) -> None:
     if (
@@ -99,132 +74,7 @@ def responseheaders(flow: http.HTTPFlow) -> None:
         and flow.request.headers.get("x-opensub-original-host")
     ):
         flow.response.stream = True
-
-
-def request(flow: http.HTTPFlow) -> None:
-    host = flow.request.pretty_host.lower().rstrip(".")
-    if host != "cursor.sh" and not host.endswith(".cursor.sh"):
-        return
-    path = flow.request.path
-    if not protocol_candidate(path):
-        return
-
-    body = flow.request.raw_content or b""
-    match = MODEL_PATTERN.search(body)
-    model = match.group(0).decode("ascii") if match else None
-    blocked = False
-
-    print("OPENSUB_EVENT\t" + json.dumps({
-        "host": host,
-        "method": flow.request.method,
-        "path": path,
-        "content_type": flow.request.headers.get("content-type", "unknown"),
-        "bytes": len(body),
-        "model": model,
-        "blocked": blocked,
-    }, separators=(",", ":")), flush=True)
 "#;
-
-#[derive(Clone, Default)]
-struct CursorProxyHandler {
-    announced_hosts: Arc<Mutex<HashSet<String>>>,
-    capture_protocol: bool,
-}
-
-impl HttpHandler for CursorProxyHandler {
-    async fn should_intercept_connect(&mut self, _ctx: &HttpContext, req: &Request<Body>) -> bool {
-        let host = req
-            .uri()
-            .host()
-            .or_else(|| req.uri().authority().map(|authority| authority.host()))
-            .unwrap_or_default();
-        let intercept = is_cursor_backend_host(host);
-        if intercept
-            && let Ok(mut announced) = self.announced_hosts.lock()
-            && announced.insert(host.to_string())
-        {
-            println!("→ Intercepting Cursor backend: {host}");
-        }
-        intercept
-    }
-
-    async fn should_intercept_tls(
-        &mut self,
-        _ctx: &HttpContext,
-        client_hello: hudsucker::rustls::server::ClientHello<'_>,
-    ) -> bool {
-        client_hello
-            .server_name()
-            .is_some_and(is_cursor_backend_host)
-    }
-
-    async fn handle_request(
-        &mut self,
-        _ctx: &HttpContext,
-        req: Request<Body>,
-    ) -> RequestOrResponse {
-        if req.method() == hudsucker::hyper::Method::CONNECT {
-            return req.into();
-        }
-
-        let method = req.method().clone();
-        let uri = req.uri().clone();
-        if !is_protocol_candidate_path(uri.path()) {
-            return req.into();
-        }
-        let content_type = req
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("unknown")
-            .to_string();
-        let (parts, body) = req.into_parts();
-        match body.collect().await {
-            Ok(collected) => {
-                let bytes = collected.to_bytes();
-                let detected_model = detect_model(&bytes);
-                let model = detected_model.as_deref().unwrap_or("unknown");
-                let captured = match capture_agent_request(
-                    uri.path(),
-                    &bytes,
-                    detected_model.as_deref(),
-                    self.capture_protocol,
-                ) {
-                    Ok(captured) => captured,
-                    Err(error) => {
-                        eprintln!("→ Failed to write requested protocol capture: {error}");
-                        false
-                    }
-                };
-                println!(
-                    "→ Agent {} {} [{}; {} bytes; model={}]",
-                    method,
-                    uri.path(),
-                    content_type,
-                    bytes.len(),
-                    model
-                );
-                if captured {
-                    println!("→ Protocol captured locally; upstream request blocked.");
-                    return Response::builder()
-                        .status(502)
-                        .body(Body::from("OpenSub protocol capture completed"))
-                        .expect("static proxy response must be valid")
-                        .into();
-                }
-                Request::from_parts(parts, Body::from(bytes)).into()
-            }
-            Err(error) => {
-                eprintln!("→ Failed to inspect Cursor request {}: {error}", uri.path());
-                Response::builder()
-                    .status(502)
-                    .body(Body::from("OpenSub could not inspect the Cursor request"))
-                    .expect("static proxy response must be valid")
-                    .into()
-            }
-        }
-    }
-}
 
 #[derive(Serialize, Deserialize)]
 struct CursorServiceState {
@@ -247,6 +97,7 @@ pub async fn ensure_service() -> Result<()> {
         .context("failed to resolve the OpenSub executable")?;
     let plist = service_plist(&executable, &mitmdump)?;
     let plist_path = service_plist_path()?;
+    set_service_enabled(true)?;
     let installed_current = fs::read(&plist_path).is_ok_and(|current| current == plist.as_bytes());
     let healthy = installed_current && service_is_loaded()? && service_is_ready();
 
@@ -294,6 +145,7 @@ pub fn service_status() -> Result<()> {
     require_macos()?;
     let installed = service_plist_path()?.exists();
     let loaded = service_is_loaded()?;
+    let enabled = service_is_enabled()?;
     let ready = loaded && service_is_ready();
     println!(
         "→ Cursor proxy service: {}",
@@ -308,7 +160,11 @@ pub fn service_status() -> Result<()> {
         }
     );
     if installed {
-        println!("→ Starts automatically at login.");
+        if enabled {
+            println!("→ Starts automatically at login.");
+        } else {
+            println!("→ Disabled until `opensub cursor proxy` is run.");
+        }
         println!("→ Logs: {}", service_log_path().display());
     }
     Ok(())
@@ -318,6 +174,7 @@ pub fn service_stop() -> Result<()> {
     require_macos()?;
     bootout_service()?;
     remove_service_state_if_present()?;
+    set_service_enabled(false)?;
     println!("→ Cursor proxy service stopped.");
     println!("→ Run `opensub cursor proxy` to start it again.");
     Ok(())
@@ -330,6 +187,7 @@ pub fn service_uninstall() -> Result<()> {
     remove_file_if_present(&service_plist_path()?)?;
     remove_file_if_present(&service_log_path())?;
     remove_file_if_present(&service_error_log_path())?;
+    set_service_enabled(true)?;
     println!("→ Cursor proxy service uninstalled.");
     println!("→ OAuth tokens and the local CA were kept.");
     Ok(())
@@ -350,6 +208,7 @@ pub async fn run_diagnostic() -> Result<()> {
 }
 
 pub async fn run_service_worker() -> Result<()> {
+    truncate_service_logs_if_oversized()?;
     run_capture(false, false, true).await
 }
 
@@ -382,10 +241,8 @@ async fn run_capture(
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
     let bridge_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let bridge_port = bridge_listener.local_addr()?.port();
-    let bridge_listener = crate::cursor_agent::TlsListener::new(
-        bridge_listener,
-        bridge_tls_acceptor(&cert_path, &key_path)?,
-    );
+    let bridge_listener =
+        crate::cursor_agent::TlsListener::new(bridge_listener, bridge_tls_acceptor(&key_path)?);
     let bridge = crate::cursor_agent::router(crate::cursor_agent::BridgeState::new(
         bridge_secret.clone(),
         capture_protocol,
@@ -396,11 +253,9 @@ async fn run_capture(
         mitmdump: &mitmdump,
         confdir: &confdir,
         addon_path: &addon_path,
-        capture_protocol,
         bridge_port,
         bridge_secret: &bridge_secret,
         upstream_ca_bundle: &upstream_ca_bundle,
-        show_events: !service_worker,
     })?;
     wait_for_local_capture(&events)?;
     let _service_ready = if service_worker {
@@ -453,76 +308,6 @@ async fn run_capture(
     Ok(())
 }
 
-#[allow(dead_code)]
-async fn run_explicit_proxy(port: u16, capture_protocol: bool) -> Result<()> {
-    require_macos()?;
-    require_official_cursor()?;
-    if !crate::auth::is_logged_in() {
-        bail!("not logged in - run `opensub login` first");
-    }
-
-    let (cert_path, key_path) = ensure_proxy_ca()?;
-    let cursor_was_running = stop_cursor_if_running()?;
-    let mut relaunch_guard = CursorRelaunchGuard::new(cursor_was_running, cert_path.clone());
-    let cert_pem = fs::read_to_string(&cert_path)
-        .with_context(|| format!("failed to read {}", cert_path.display()))?;
-    let key_pem = fs::read_to_string(&key_path)
-        .with_context(|| format!("failed to read {}", key_path.display()))?;
-    let key_pair = KeyPair::from_pem(&key_pem).context("invalid OpenSub proxy CA key")?;
-    let issuer = Issuer::from_ca_cert_pem(&cert_pem, key_pair)
-        .context("invalid OpenSub proxy CA certificate")?;
-    let ca = RcgenAuthority::new(issuer, 128, aws_lc_rs::default_provider());
-
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind Cursor proxy at {addr}"))?;
-    let spki = certificate_spki_hash(&cert_path)?;
-    let preload_path = ensure_undici_preload(port)?;
-    if capture_protocol {
-        let capture_path = protocol_capture_path();
-        if capture_path.exists() {
-            fs::remove_file(&capture_path)?;
-        }
-    }
-
-    let proxy = Proxy::builder()
-        .with_listener(listener)
-        .with_ca(ca)
-        .with_rustls_connector(aws_lc_rs::default_provider())
-        .with_http_handler(CursorProxyHandler {
-            capture_protocol,
-            ..CursorProxyHandler::default()
-        })
-        .with_graceful_shutdown(shutdown_signal())
-        .build()
-        .context("failed to create Cursor proxy")?;
-
-    let settings_guard = CursorSettingsGuard::apply(port)?;
-    launch_cursor(port, &spki, &cert_path, &preload_path)?;
-    relaunch_guard.disarm();
-    println!("→ Cursor proxy listening on http://{addr}");
-    println!("→ Official Cursor launched; GPT routing discovery is active.");
-    println!("→ Other Cursor traffic is passed through without inspection.");
-    if capture_protocol {
-        println!(
-            "→ Protocol capture: {}",
-            config::data_dir()
-                .join("cursor-proxy")
-                .join("last-agent-request.bin")
-                .display()
-        );
-    }
-    println!("→ Ctrl-C stops the proxy.\n");
-
-    let proxy_result = proxy
-        .start()
-        .await
-        .context("Cursor proxy stopped unexpectedly");
-    let restore_result = settings_guard.restore();
-    proxy_result.and(restore_result)
-}
-
 enum LocalCaptureEvent {
     Ready,
     Exited(String),
@@ -536,11 +321,9 @@ struct LocalCaptureConfig<'a> {
     mitmdump: &'a Path,
     confdir: &'a Path,
     addon_path: &'a Path,
-    capture_protocol: bool,
     bridge_port: u16,
     bridge_secret: &'a str,
     upstream_ca_bundle: &'a Path,
-    show_events: bool,
 }
 
 impl Drop for LocalCaptureGuard {
@@ -753,6 +536,15 @@ fn prepare_service_logs() -> Result<()> {
     Ok(())
 }
 
+fn truncate_service_logs_if_oversized() -> Result<()> {
+    for path in [service_log_path(), service_error_log_path()] {
+        if fs::metadata(&path).is_ok_and(|metadata| metadata.len() > MAX_SERVICE_LOG_BYTES) {
+            fs::OpenOptions::new().write(true).open(path)?.set_len(0)?;
+        }
+    }
+    Ok(())
+}
+
 fn launchctl_domain() -> Result<String> {
     let output = Command::new("/usr/bin/id")
         .arg("-u")
@@ -779,6 +571,18 @@ fn service_is_loaded() -> Result<bool> {
         .status()
         .context("failed to inspect the Cursor proxy service")?
         .success())
+}
+
+fn service_is_enabled() -> Result<bool> {
+    let output = Command::new("/bin/launchctl")
+        .args(["print-disabled", &launchctl_domain()?])
+        .output()
+        .context("failed to inspect the Cursor proxy service policy")?;
+    if !output.status.success() {
+        bail!("could not inspect the Cursor proxy service policy");
+    }
+    let disabled = format!("\"{SERVICE_LABEL}\" => disabled");
+    Ok(!String::from_utf8_lossy(&output.stdout).contains(&disabled))
 }
 
 fn service_is_ready() -> bool {
@@ -822,6 +626,21 @@ fn bootstrap_service(plist_path: &Path) -> Result<()> {
     if !output.status.success() {
         bail!(
             "launchctl could not start the Cursor proxy service: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn set_service_enabled(enabled: bool) -> Result<()> {
+    let action = if enabled { "enable" } else { "disable" };
+    let output = Command::new("/bin/launchctl")
+        .args([action, &launchctl_target()?])
+        .output()
+        .with_context(|| format!("failed to {action} the Cursor proxy service"))?;
+    if !output.status.success() {
+        bail!(
+            "launchctl could not {action} the Cursor proxy service: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
@@ -1004,14 +823,23 @@ fn write_upstream_ca_bundle(path: &Path, opensub_ca: &[u8]) -> Result<()> {
     replace_file(path, &bundle, 0o600)
 }
 
-fn bridge_tls_acceptor(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor> {
-    let ca_cert = fs::read_to_string(cert_path)
-        .with_context(|| format!("failed to read {}", cert_path.display()))?;
+fn bridge_tls_acceptor(key_path: &Path) -> Result<TlsAcceptor> {
     let ca_key = fs::read_to_string(key_path)
         .with_context(|| format!("failed to read {}", key_path.display()))?;
     let ca_key = KeyPair::from_pem(&ca_key).context("invalid OpenSub proxy CA key")?;
-    let issuer = Issuer::from_ca_cert_pem(&ca_cert, ca_key)
-        .context("invalid OpenSub proxy CA certificate")?;
+    let (leaf, leaf_key) = bridge_certificate(ca_key)?;
+
+    let provider = Arc::new(ring::default_provider());
+    let mut config = ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
+        .with_no_client_auth()
+        .with_single_cert(vec![leaf.der().clone()], leaf_key.into())?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+fn bridge_certificate(ca_key: KeyPair) -> Result<(Certificate, KeyPair)> {
+    let issuer = Issuer::new(proxy_ca_params(), ca_key);
 
     let leaf_key = KeyPair::generate().context("failed to generate local bridge TLS key")?;
     let mut params = CertificateParams::new(vec!["127.0.0.1".to_string()])?;
@@ -1026,14 +854,7 @@ fn bridge_tls_acceptor(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor>
     let leaf = params
         .signed_by(&leaf_key, &issuer)
         .context("failed to sign local bridge TLS certificate")?;
-
-    let provider = Arc::new(aws_lc_rs::default_provider());
-    let mut config = ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
-        .with_no_client_auth()
-        .with_single_cert(vec![leaf.der().clone()], leaf_key.into())?;
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    Ok(TlsAcceptor::from(Arc::new(config)))
+    Ok((leaf, leaf_key))
 }
 
 fn ensure_proxy_ca_trusted(cert_path: &Path) -> Result<()> {
@@ -1118,10 +939,6 @@ fn start_local_capture(
         ))
         .args(["--scripts"])
         .arg(config.addon_path)
-        .env(
-            "OPENSUB_CAPTURE_PROTOCOL",
-            if config.capture_protocol { "1" } else { "0" },
-        )
         .env("OPENSUB_BRIDGE_PORT", config.bridge_port.to_string())
         .env("OPENSUB_BRIDGE_SECRET", config.bridge_secret)
         .stdout(Stdio::piped())
@@ -1135,15 +952,10 @@ fn start_local_capture(
     let (events_tx, events_rx) = mpsc::channel();
     let ready_sent = Arc::new(AtomicBool::new(false));
     if let Some(stdout) = stdout {
-        drain_local_capture_output(
-            stdout,
-            events_tx.clone(),
-            Arc::clone(&ready_sent),
-            config.show_events,
-        );
+        drain_local_capture_output(stdout, events_tx.clone(), Arc::clone(&ready_sent));
     }
     if let Some(stderr) = stderr {
-        drain_local_capture_output(stderr, events_tx.clone(), ready_sent, config.show_events);
+        drain_local_capture_output(stderr, events_tx.clone(), ready_sent);
     }
     watch_local_capture_exit(Arc::clone(&child), events_tx);
     Ok((LocalCaptureGuard { child }, events_rx))
@@ -1153,7 +965,6 @@ fn drain_local_capture_output<R>(
     reader: R,
     events: mpsc::Sender<LocalCaptureEvent>,
     ready_sent: Arc<AtomicBool>,
-    show_events: bool,
 ) where
     R: std::io::Read + Send + 'static,
 {
@@ -1164,32 +975,8 @@ fn drain_local_capture_output<R>(
             {
                 let _ = events.send(LocalCaptureEvent::Ready);
             }
-            if show_events && let Some(event) = line.split("OPENSUB_EVENT\t").nth(1) {
-                print_local_capture_event(event);
-            }
         }
     });
-}
-
-fn print_local_capture_event(raw: &str) {
-    let Ok(event) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return;
-    };
-    if let Some(model) = event["model"]
-        .as_str()
-        .filter(|_| should_print_local_capture_event(&event))
-    {
-        println!("→ OpenAI request intercepted by OpenSub [model={model}]");
-    }
-    if event["blocked"].as_bool() == Some(true) {
-        println!("→ Protocol captured locally; upstream request blocked.");
-    }
-}
-
-fn should_print_local_capture_event(event: &serde_json::Value) -> bool {
-    event["model"]
-        .as_str()
-        .is_some_and(|model| model.to_ascii_lowercase().starts_with("gpt-"))
 }
 
 fn watch_local_capture_exit(
@@ -1255,122 +1042,6 @@ fn launch_cursor_direct(cert_path: &Path) -> Result<()> {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct CursorSettingsBackup {
-    existed: bool,
-    mode: u32,
-    contents_base64: String,
-}
-
-struct CursorSettingsGuard {
-    settings_path: PathBuf,
-    backup_path: PathBuf,
-    restored: bool,
-}
-
-impl CursorSettingsGuard {
-    fn apply(port: u16) -> Result<Self> {
-        let settings_path = cursor_settings_path()?;
-        let backup_path = config::data_dir()
-            .join("cursor-proxy")
-            .join(CURSOR_SETTINGS_BACKUP_NAME);
-        if backup_path.exists() {
-            restore_cursor_settings(&settings_path, &backup_path)
-                .context("failed to recover Cursor settings from a previous proxy run")?;
-        }
-
-        let existed = settings_path.exists();
-        let original = if existed {
-            fs::read(&settings_path)
-                .with_context(|| format!("failed to read {}", settings_path.display()))?
-        } else {
-            b"{}\n".to_vec()
-        };
-        let mode = if existed {
-            fs::metadata(&settings_path)?.permissions().mode() & 0o777
-        } else {
-            0o600
-        };
-        let backup = CursorSettingsBackup {
-            existed,
-            mode,
-            contents_base64: base64::engine::general_purpose::STANDARD.encode(&original),
-        };
-        write_private_file(&backup_path, &serde_json::to_vec_pretty(&backup)?)?;
-
-        let patched = patch_cursor_settings(&original, port)?;
-        if let Err(error) = replace_file(&settings_path, &patched, mode) {
-            let _ = restore_cursor_settings(&settings_path, &backup_path);
-            return Err(error);
-        }
-
-        Ok(Self {
-            settings_path,
-            backup_path,
-            restored: false,
-        })
-    }
-
-    fn restore(mut self) -> Result<()> {
-        let result = restore_cursor_settings(&self.settings_path, &self.backup_path);
-        self.restored = result.is_ok();
-        result
-    }
-}
-
-impl Drop for CursorSettingsGuard {
-    fn drop(&mut self) {
-        if !self.restored
-            && let Err(error) = restore_cursor_settings(&self.settings_path, &self.backup_path)
-        {
-            eprintln!("→ Failed to restore Cursor proxy settings: {error}");
-        }
-    }
-}
-
-fn cursor_settings_path() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join("Library/Application Support/Cursor/User/settings.json"))
-}
-
-fn patch_cursor_settings(original: &[u8], port: u16) -> Result<Vec<u8>> {
-    let text = std::str::from_utf8(original).context("Cursor settings are not valid UTF-8")?;
-    let mut value: serde_json::Value =
-        jsonc_parser::parse_to_serde_value(text, &Default::default())
-            .context("Cursor settings.json is not valid JSONC")?;
-    let object = value
-        .as_object_mut()
-        .context("Cursor settings.json must contain a JSON object")?;
-    object.insert(
-        "http.proxy".to_string(),
-        serde_json::Value::String(format!("http://127.0.0.1:{port}")),
-    );
-    object.insert(
-        "http.proxySupport".to_string(),
-        serde_json::Value::String("override".to_string()),
-    );
-    let mut output = serde_json::to_vec_pretty(&value)?;
-    output.push(b'\n');
-    Ok(output)
-}
-
-fn restore_cursor_settings(settings_path: &Path, backup_path: &Path) -> Result<()> {
-    let backup: CursorSettingsBackup = serde_json::from_slice(
-        &fs::read(backup_path)
-            .with_context(|| format!("failed to read {}", backup_path.display()))?,
-    )?;
-    if backup.existed {
-        let contents = base64::engine::general_purpose::STANDARD
-            .decode(backup.contents_base64)
-            .context("invalid Cursor settings backup")?;
-        replace_file(settings_path, &contents, backup.mode)?;
-    } else if settings_path.exists() {
-        fs::remove_file(settings_path)?;
-    }
-    fs::remove_file(backup_path)?;
-    Ok(())
-}
-
 fn replace_file(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1409,6 +1080,16 @@ fn ensure_proxy_ca() -> Result<(PathBuf, PathBuf)> {
     }
 
     let key_pair = KeyPair::generate().context("failed to generate Cursor proxy CA key")?;
+    let cert = proxy_ca_params()
+        .self_signed(&key_pair)
+        .context("failed to create Cursor proxy CA certificate")?;
+
+    write_private_file(&key_path, key_pair.serialize_pem().as_bytes())?;
+    write_private_file(&cert_path, cert.pem().as_bytes())?;
+    Ok((cert_path, key_path))
+}
+
+fn proxy_ca_params() -> CertificateParams {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params.key_usages = vec![
@@ -1420,39 +1101,7 @@ fn ensure_proxy_ca() -> Result<(PathBuf, PathBuf)> {
     name.push(DnType::CommonName, "OpenSub Cursor Proxy");
     name.push(DnType::OrganizationName, "OpenSub");
     params.distinguished_name = name;
-    let cert = params
-        .self_signed(&key_pair)
-        .context("failed to create Cursor proxy CA certificate")?;
-
-    write_private_file(&key_path, key_pair.serialize_pem().as_bytes())?;
-    write_private_file(&cert_path, cert.pem().as_bytes())?;
-    Ok((cert_path, key_path))
-}
-
-fn ensure_undici_preload(port: u16) -> Result<PathBuf> {
-    let path = config::data_dir()
-        .join("cursor-proxy")
-        .join(UNDICI_PRELOAD_NAME);
-    let proxy_url = format!("http://127.0.0.1:{port}");
-    let script = format!(
-        r#"'use strict';
-try {{
-  const undici = require('/Applications/Cursor.app/Contents/Resources/app/node_modules/undici');
-  undici.setGlobalDispatcher(new undici.EnvHttpProxyAgent({{
-    httpProxy: {proxy},
-    httpsProxy: {proxy},
-    noProxy: '127.0.0.1,localhost,::1',
-    allowH2: true
-  }}));
-}} catch (_) {{}}
-"#,
-        proxy = serde_json::to_string(&proxy_url)?
-    );
-    if path.exists() {
-        fs::remove_file(&path)?;
-    }
-    write_private_file(&path, script.as_bytes())?;
-    Ok(path)
+    params
 }
 
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -1468,131 +1117,10 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn certificate_spki_hash(cert_path: &Path) -> Result<String> {
-    let public_key = Command::new("openssl")
-        .args(["x509", "-pubkey", "-noout", "-in"])
-        .arg(cert_path)
-        .output()
-        .context("failed to run openssl while reading proxy CA")?;
-    if !public_key.status.success() {
-        bail!("openssl could not read the proxy CA certificate");
-    }
-
-    let mut der = Command::new("openssl")
-        .args(["pkey", "-pubin", "-outform", "DER"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to run openssl while hashing proxy CA")?;
-    der.stdin
-        .take()
-        .context("failed to open openssl stdin")?
-        .write_all(&public_key.stdout)?;
-    let der = der.wait_with_output()?;
-    if !der.status.success() {
-        bail!("openssl could not parse the proxy CA public key");
-    }
-    Ok(base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(der.stdout)))
-}
-
-fn launch_cursor(port: u16, spki: &str, cert_path: &Path, preload_path: &Path) -> Result<()> {
-    let proxy_url = format!("http://127.0.0.1:{port}");
-    let proxy = format!("--proxy-server={proxy_url}");
-    let trust = format!("--ignore-certificate-errors-spki-list={spki}");
-    let https_proxy = format!("HTTPS_PROXY={proxy_url}");
-    let http_proxy = format!("HTTP_PROXY={proxy_url}");
-    let lower_https_proxy = format!("https_proxy={proxy_url}");
-    let lower_http_proxy = format!("http_proxy={proxy_url}");
-    let extra_ca = format!("NODE_EXTRA_CA_CERTS={}", cert_path.display());
-    let preload_option = format!("--require={}", preload_path.display());
-    let node_options = match std::env::var("NODE_OPTIONS") {
-        Ok(existing) if !existing.trim().is_empty() => {
-            format!("NODE_OPTIONS={existing} {preload_option}")
-        }
-        _ => format!("NODE_OPTIONS={preload_option}"),
-    };
-    let output = Command::new("open")
-        .arg("-n")
-        .args(["--env", &https_proxy])
-        .args(["--env", &http_proxy])
-        .args(["--env", &lower_https_proxy])
-        .args(["--env", &lower_http_proxy])
-        .args(["--env", "NODE_USE_ENV_PROXY=1"])
-        .args(["--env", &node_options])
-        .args(["--env", &extra_ca])
-        .args(["--env", "NO_PROXY=127.0.0.1,localhost,::1"])
-        .args(["--env", "no_proxy=127.0.0.1,localhost,::1"])
-        .args([CURSOR_APP, "--args"])
-        .args([proxy.as_str(), trust.as_str()])
-        .output()
-        .context("failed to launch official Cursor")?;
-    if !output.status.success() {
-        bail!(
-            "failed to launch official Cursor: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-fn detect_model(bytes: &[u8]) -> Option<String> {
-    let start = bytes.windows(4).position(|window| window == b"gpt-")?;
-    let slug = bytes[start..]
-        .iter()
-        .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-        .copied()
-        .collect::<Vec<_>>();
-    String::from_utf8(slug).ok()
-}
-
-fn capture_agent_request(
-    path: &str,
-    bytes: &[u8],
-    model: Option<&str>,
-    enabled: bool,
-) -> Result<bool> {
-    if !enabled || bytes.is_empty() || !should_capture_protocol(path, model) {
-        return Ok(false);
-    }
-    let path = protocol_capture_path();
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    Ok(true)
-}
-
 fn protocol_capture_path() -> PathBuf {
     config::data_dir()
         .join("cursor-proxy")
         .join("last-agent-request.bin")
-}
-
-fn should_capture_protocol(path: &str, model: Option<&str>) -> bool {
-    let path = path.to_ascii_lowercase();
-    path.contains("agent") || path.contains("composer") || model.is_some()
-}
-
-fn is_protocol_candidate_path(path: &str) -> bool {
-    let path = path.to_ascii_lowercase();
-    path.contains("agent") || path.contains("composer") || path.contains(".aiservice/")
-}
-
-fn is_cursor_backend_host(host: &str) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    matches!(
-        host.as_str(),
-        "api2.cursor.sh" | "api3.cursor.sh" | "api4.cursor.sh" | "api5.cursor.sh"
-    ) || host == "agent.api5.cursor.sh"
-        || (host.starts_with("agent-") && host.ends_with(".api5.cursor.sh"))
-        || (host.starts_with("agentn-") && host.ends_with(".api5.cursor.sh"))
-        || host == "agentn.api5.cursor.sh"
 }
 
 fn require_macos() -> Result<()> {
@@ -1693,28 +1221,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn intercepts_only_cursor_backend_hosts() {
-        assert!(is_cursor_backend_host("api2.cursor.sh"));
-        assert!(is_cursor_backend_host("api4.cursor.sh"));
-        assert!(is_cursor_backend_host("agent.api5.cursor.sh"));
-        assert!(is_cursor_backend_host("agent-gcpp-uswest.api5.cursor.sh"));
-        assert!(is_cursor_backend_host(
-            "agentn-gcpp-eucentral.api5.cursor.sh"
-        ));
-        assert!(!is_cursor_backend_host("authentication.cursor.sh"));
-        assert!(!is_cursor_backend_host("example.com"));
-    }
-
-    #[test]
-    fn detects_dynamic_gpt_model_names() {
-        assert_eq!(
-            detect_model(b"prefix gpt-5.6-sol-none\0suffix"),
-            Some("gpt-5.6-sol-none".to_string())
-        );
-        assert_eq!(detect_model(b"composer-2"), None);
-    }
-
-    #[test]
     fn launch_agent_runs_persistent_hidden_worker() {
         let executable = std::env::current_exe().unwrap();
         let plist = service_plist(&executable, Path::new("/tmp/mitm&dump")).unwrap();
@@ -1728,68 +1234,38 @@ mod tests {
     }
 
     #[test]
-    fn terminal_capture_output_only_includes_detected_gpt_models() {
-        assert!(should_print_local_capture_event(&serde_json::json!({
-            "model": "gpt-5.6-sol-none"
-        })));
-        assert!(!should_print_local_capture_event(&serde_json::json!({
-            "phase": "bridge",
-            "model": null
-        })));
-        assert!(!should_print_local_capture_event(&serde_json::json!({
-            "model": "composer-2.5"
-        })));
-    }
+    fn bridge_certificate_chains_to_proxy_ca_for_localhost() {
+        use rustls::client::danger::ServerCertVerifier;
 
-    #[test]
-    fn buffers_only_protocol_candidate_requests() {
-        assert!(is_protocol_candidate_path("/aiserver.v1.AgentService/Run"));
-        assert!(is_protocol_candidate_path(
-            "/aiserver.v1.BackgroundComposerService/Start"
-        ));
-        assert!(is_protocol_candidate_path(
-            "/aiserver.v1.AiService/StreamChat"
-        ));
-        assert!(!is_protocol_candidate_path(
-            "/aiserver.v1.CodebaseSnapshotService/UploadPackfileChunk"
-        ));
-    }
-
-    #[test]
-    fn patches_jsonc_cursor_proxy_settings() {
-        let patched = patch_cursor_settings(
-            br#"{
-                // Cursor settings may contain comments and trailing commas.
-                "window.autoDetectColorScheme": true,
-            }"#,
-            9876,
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_cert = proxy_ca_params().self_signed(&ca_key).unwrap();
+        let (leaf, _) = bridge_certificate(ca_key).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca_cert.der().clone()).unwrap();
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(ring::default_provider()),
         )
+        .build()
         .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&patched).unwrap();
-        assert_eq!(value["http.proxy"], "http://127.0.0.1:9876");
-        assert_eq!(value["http.proxySupport"], "override");
-        assert_eq!(value["window.autoDetectColorScheme"], true);
-    }
+        let server_name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
 
-    #[test]
-    fn telemetry_does_not_replace_protocol_capture() {
-        assert!(!should_capture_protocol(
-            "/aiserver.v1.AiService/ReportClientNumericMetrics",
-            None
-        ));
-        assert!(should_capture_protocol(
-            "/aiserver.v1.AgentService/Run",
-            None
-        ));
-        assert!(should_capture_protocol(
-            "/aiserver.v1.AiService/StreamChat",
-            Some("gpt-5.6-sol-none")
-        ));
+        verifier
+            .verify_server_cert(
+                leaf.der(),
+                &[],
+                &server_name,
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+            .unwrap();
     }
 
     #[test]
     fn local_capture_streams_agent_responses() {
         assert!(MITMPROXY_ADDON.contains("def responseheaders"));
         assert!(MITMPROXY_ADDON.contains("flow.response.stream = True"));
+        assert!(!MITMPROXY_ADDON.contains("OPENSUB_EVENT"));
+        assert!(!MITMPROXY_ADDON.contains("MODEL_PATTERN"));
     }
 }

@@ -10,54 +10,34 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub stream: bool,
-    /// Accepted for legacy Chat Completions compatibility. The Responses-shaped
-    /// Cursor path preserves these fields directly; the legacy translator keeps
-    /// its output conservative for the Codex backend.
-    #[allow(dead_code)]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
-    #[allow(dead_code)]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
-    #[allow(dead_code)]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_completion_tokens: Option<u32>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub tools: Vec<ChatTool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
-    /// Catch-all for legacy Chat Completions fields we accept but don't model.
-    #[allow(dead_code)]
-    #[serde(flatten)]
-    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// A single message in a Chat Completions request.
 ///
 /// `content` can be a string or an array of content parts; we keep it as raw
 /// JSON to preserve whatever Cursor sends.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub content: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub tool_call_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub tool_calls: Vec<ChatToolCall>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ChatToolCall {
     pub id: String,
-    #[serde(rename = "type")]
-    pub kind: String,
     pub function: ChatToolCallFunction,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ChatToolCallFunction {
     pub name: String,
     pub arguments: String,
@@ -67,7 +47,7 @@ pub struct ChatToolCallFunction {
 /// shape Cursor sends (`function`, but also built-in tools like `web_search`,
 /// `code_interpreter`, `image_generation`, etc., which don't have a `function`
 /// field and would otherwise fail deserialization).
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ChatTool(pub serde_json::Value);
 
 impl ChatTool {
@@ -82,10 +62,10 @@ impl ChatTool {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ChatToolFunction {
     pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
     pub parameters: serde_json::Value,

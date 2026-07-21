@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
+use std::sync::OnceLock;
 
 use crate::auth::store::TokenData;
 use crate::config;
@@ -11,14 +12,27 @@ use crate::types::responses::ResponsesRequest;
 pub type ByteStream =
     std::pin::Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>;
 
+static CODEX_CLIENT: OnceLock<Client> = OnceLock::new();
+
+fn codex_client() -> Result<&'static Client> {
+    if let Some(client) = CODEX_CLIENT.get() {
+        return Ok(client);
+    }
+    let client = Client::builder()
+        .user_agent(config::codex_user_agent())
+        .build()?;
+    let _ = CODEX_CLIENT.set(client);
+    Ok(CODEX_CLIENT
+        .get()
+        .expect("Codex client is initialized by this function"))
+}
+
 /// Open a streaming `POST {upstream}/responses` call and return the byte stream.
 pub async fn post_responses_stream(
     tokens: &TokenData,
     body: &serde_json::Value,
 ) -> Result<ByteStream> {
-    let client = Client::builder()
-        .user_agent(config::codex_user_agent())
-        .build()?;
+    let client = codex_client()?;
 
     let upstream = config::validated_upstream()?;
     let url = format!("{}/responses", upstream.trim_end_matches('/'));
@@ -88,9 +102,7 @@ pub async fn probe(tokens: &TokenData) -> Result<()> {
     }];
     body.stream = true; // the Codex backend rejects non-streaming requests
 
-    let client = Client::builder()
-        .user_agent(config::codex_user_agent())
-        .build()?;
+    let client = codex_client()?;
     let upstream = config::validated_upstream()?;
     let url = format!("{}/responses", upstream.trim_end_matches('/'));
     let body_json = serde_json::to_value(&body)?;
@@ -152,4 +164,16 @@ pub async fn probe(tokens: &TokenData) -> Result<()> {
     let text = String::from_utf8_lossy(&buf);
     println!("→ first events:\n{}", text.trim());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reuses_one_codex_http_client() {
+        let first = codex_client().unwrap();
+        let second = codex_client().unwrap();
+        assert!(std::ptr::eq(first, second));
+    }
 }

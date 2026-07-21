@@ -416,4 +416,33 @@ mod tests {
                 .contains(&json!("reasoning.encrypted_content"))
         );
     }
+
+    #[test]
+    fn legacy_chat_body_accepts_ignored_compatibility_fields() {
+        let raw = json!({
+            "model": "gpt-5.5",
+            "messages": [
+                {"role": "system", "name": "policy", "content": "Be precise."},
+                {"role": "user", "content": "Hello"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                }
+            ],
+            "temperature": 0.4,
+            "max_tokens": 512,
+            "max_completion_tokens": 256,
+            "unknown_cursor_field": {"accepted": true}
+        });
+
+        let prepared = prepare_upstream_body(raw).unwrap();
+
+        assert_eq!(prepared.model, "gpt-5.5");
+        assert_eq!(prepared.body["instructions"], "Be precise.");
+        assert_eq!(prepared.body["input"].as_array().unwrap().len(), 2);
+    }
 }

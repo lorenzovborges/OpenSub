@@ -243,12 +243,11 @@ impl StreamTranslator {
                 } else {
                     "stop"
                 };
-                let mut choice = ChunkChoice {
+                let choice = ChunkChoice {
                     index: 0,
                     delta: Some(Delta::default()),
                     finish_reason: Some(finish_reason.to_string()),
                 };
-                let _ = &mut choice; // (placeholder for future per-choice tweaks)
                 let mut chunk = self.chunk(choice);
                 if let Some(usage) = event.response.as_ref().and_then(extract_usage) {
                     chunk.usage = Some(usage);
