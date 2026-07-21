@@ -14,7 +14,7 @@ tokio-stream = "0.1"
 
 # HTTP server + client
 axum = { version = "0.8", features = ["json"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "http2"] }
 bytes = "1"
 hudsucker = { version = "0.25", features = ["http2"] }
 http-body-util = "0.1"

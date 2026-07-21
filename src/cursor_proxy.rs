@@ -47,7 +47,6 @@ import os
 import re
 
 CAPTURE = os.environ.get("OPENSUB_CAPTURE_PROTOCOL") == "1"
-CAPTURE_PATH = os.environ.get("OPENSUB_CAPTURE_PATH", "")
 BRIDGE_PORT = int(os.environ.get("OPENSUB_BRIDGE_PORT", "0"))
 BRIDGE_SECRET = os.environ.get("OPENSUB_BRIDGE_SECRET", "")
 MODEL_PATTERN = re.compile(br"gpt-[A-Za-z0-9_.-]+")
@@ -62,34 +61,11 @@ def protocol_candidate(path: str) -> bool:
     return "agent" in path or "composer" in path or ".aiservice/" in path
 
 
-def should_capture(path: str, model: str | None) -> bool:
-    operation = path.rsplit("/", 1)[-1].lower()
-    return model is not None or any(
-        token in operation
-        for token in ("stream", "chat", "run", "generate", "complete")
-    )
-
-
-def write_capture(body: bytes) -> None:
-    temporary = CAPTURE_PATH + ".tmp"
-    descriptor = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
-    try:
-        with os.fdopen(descriptor, "wb") as capture:
-            capture.write(body)
-            capture.flush()
-            os.fsync(capture.fileno())
-        os.replace(temporary, CAPTURE_PATH)
-        os.chmod(CAPTURE_PATH, 0o600)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-
-
 def requestheaders(flow: http.HTTPFlow) -> None:
     host = flow.request.pretty_host.lower().rstrip(".")
     if host != "cursor.sh" and not host.endswith(".cursor.sh"):
         return
-    if flow.request.path != "/agent.v1.AgentService/Run" or CAPTURE:
+    if flow.request.path != "/agent.v1.AgentService/Run":
         return
 
     flow.request.headers["x-opensub-original-host"] = host
@@ -131,14 +107,7 @@ def request(flow: http.HTTPFlow) -> None:
     body = flow.request.raw_content or b""
     match = MODEL_PATTERN.search(body)
     model = match.group(0).decode("ascii") if match else None
-    blocked = CAPTURE and bool(body) and should_capture(path, model)
-    if blocked:
-        write_capture(body)
-        flow.response = http.Response.make(
-            502,
-            b"OpenSub protocol capture completed",
-            {"content-type": "text/plain"},
-        )
+    blocked = False
 
     print("OPENSUB_EVENT\t" + json.dumps({
         "host": host,
@@ -280,13 +249,13 @@ pub async fn run(capture_protocol: bool) -> Result<()> {
     );
     let bridge = crate::cursor_agent::router(crate::cursor_agent::BridgeState::new(
         bridge_secret.clone(),
+        capture_protocol,
     )?);
     let bridge_task = tokio::spawn(async move { axum::serve(bridge_listener, bridge).await });
 
     let (guard, events) = start_local_capture(
         &confdir,
         &addon_path,
-        &capture_path,
         capture_protocol,
         bridge_port,
         &bridge_secret,
@@ -581,7 +550,6 @@ fn certificate_sha256_fingerprint(cert_path: &Path) -> Result<String> {
 fn start_local_capture(
     confdir: &Path,
     addon_path: &Path,
-    capture_path: &Path,
     capture_protocol: bool,
     bridge_port: u16,
     bridge_secret: &str,
@@ -608,7 +576,6 @@ fn start_local_capture(
             "OPENSUB_CAPTURE_PROTOCOL",
             if capture_protocol { "1" } else { "0" },
         )
-        .env("OPENSUB_CAPTURE_PATH", capture_path)
         .env("OPENSUB_BRIDGE_PORT", bridge_port.to_string())
         .env("OPENSUB_BRIDGE_SECRET", bridge_secret)
         .stdout(Stdio::piped())

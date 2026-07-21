@@ -80,16 +80,18 @@ pub struct BridgeState {
     secret: Arc<str>,
     client: reqwest::Client,
     events: Arc<EventLog>,
+    capture_protocol: bool,
 }
 
 impl BridgeState {
-    pub fn new(secret: String) -> Result<Self> {
+    pub fn new(secret: String, capture_protocol: bool) -> Result<Self> {
         Ok(Self {
             secret: secret.into(),
             client: reqwest::Client::builder()
                 .user_agent("OpenSub Cursor Bridge")
                 .build()?,
             events: Arc::new(EventLog::new()?),
+            capture_protocol,
         })
     }
 }
@@ -159,7 +161,7 @@ async fn run(State(state): State<BridgeState>, request: Request) -> Response {
         Ok(response) => response,
         Err(error) => {
             state.events.record(bridge_error_event(&error), None);
-            tracing::warn!(error = %error, "Cursor Agent bridge request failed");
+            tracing::warn!(error = %format!("{error:#}"), "Cursor Agent bridge request failed");
             connect_error_response("OpenSub could not process the Cursor Agent request")
         }
     }
@@ -189,6 +191,15 @@ async fn route_request(state: BridgeState, request: Request) -> Result<Response>
     let message = decode_connect_message(frame.flags, frame.payload)?;
     let agent = AgentRequest::parse(&message)?;
 
+    if state.capture_protocol {
+        write_protocol_capture(&message)?;
+        state
+            .events
+            .record("protocol_captured", Some(&agent.requested_model));
+        println!("→ Agent protocol captured locally; upstream request blocked.");
+        bail!("Agent protocol capture completed");
+    }
+
     if !is_openai_model(&agent.requested_model) {
         state
             .events
@@ -217,6 +228,25 @@ async fn route_request(state: BridgeState, request: Request) -> Result<Response>
     tokio::spawn(read_client_stream(initial_remainder, incoming, client_tx));
 
     Ok(openai_response(agent, client_rx, Arc::clone(&state.events)).await)
+}
+
+fn write_protocol_capture(message: &[u8]) -> Result<()> {
+    let path = config::data_dir()
+        .join("cursor-proxy")
+        .join("last-agent-request.bin");
+    let parent = path.parent().context("protocol capture has no parent")?;
+    fs::create_dir_all(parent)?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)?;
+    file.write_all(message)?;
+    file.sync_all()?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }
 
 fn bridge_error_event(error: &anyhow::Error) -> &'static str {
