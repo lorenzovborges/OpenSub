@@ -168,10 +168,10 @@ fn normalize_responses_request(body: &mut Value) -> anyhow::Result<()> {
 
     lift_system_instructions(obj);
 
-    if let Some(model) = obj.get("model").and_then(Value::as_str) {
-        if let Some(stripped) = model.strip_suffix("-extra") {
-            obj.insert("model".to_string(), Value::String(stripped.to_string()));
-        }
+    if let Some(model) = obj.get("model").and_then(Value::as_str)
+        && let Some(stripped) = model.strip_suffix("-extra")
+    {
+        obj.insert("model".to_string(), Value::String(stripped.to_string()));
     }
 
     obj.insert("store".to_string(), Value::Bool(false));
@@ -228,10 +228,10 @@ fn lift_system_instructions(obj: &mut Map<String, Value>) {
             })
             .unwrap_or(false);
         if is_system {
-            if let Some(text) = item.get("content").and_then(content_value_to_string) {
-                if !text.trim().is_empty() {
-                    system_text.push(text);
-                }
+            if let Some(text) = item.get("content").and_then(content_value_to_string)
+                && !text.trim().is_empty()
+            {
+                system_text.push(text);
             }
         } else {
             remaining.push(item);
@@ -243,10 +243,10 @@ fn lift_system_instructions(obj: &mut Map<String, Value>) {
         return;
     }
     let mut parts = Vec::new();
-    if let Some(existing) = obj.get("instructions").and_then(Value::as_str) {
-        if !existing.trim().is_empty() {
-            parts.push(existing.to_string());
-        }
+    if let Some(existing) = obj.get("instructions").and_then(Value::as_str)
+        && !existing.trim().is_empty()
+    {
+        parts.push(existing.to_string());
     }
     parts.extend(system_text);
     obj.insert(
@@ -291,14 +291,14 @@ fn non_streaming_response(sse_bytes: &[u8]) -> Json<serde_json::Value> {
                 continue;
             }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(rest) {
-                if let Some(delta) = v
+                if let Some(t) = v
                     .get("choices")
                     .and_then(|c| c.get(0))
                     .and_then(|c| c.get("delta"))
+                    .and_then(|delta| delta.get("content"))
+                    .and_then(|content| content.as_str())
                 {
-                    if let Some(t) = delta.get("content").and_then(|c| c.as_str()) {
-                        content.push_str(t);
-                    }
+                    content.push_str(t);
                 }
                 if let Some(fr) = v
                     .get("choices")

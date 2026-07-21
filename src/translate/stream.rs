@@ -204,26 +204,26 @@ impl StreamTranslator {
                             } else {
                                 jstr(item, "arguments")
                             };
-                            if let Some(args) = args {
-                                if !args.is_empty() {
-                                    let idx = self.resolve_index(&item_id);
-                                    self.add_args_len(&item_id, args.len());
-                                    out.push(self.chunk(ChunkChoice {
-                                        index: 0,
-                                        delta: Some(Delta {
-                                            tool_calls: vec![ChunkToolCall {
-                                                index: idx,
-                                                function: Some(ChunkToolCallFunction {
-                                                    arguments: Some(args),
-                                                    ..Default::default()
-                                                }),
+                            if let Some(args) = args
+                                && !args.is_empty()
+                            {
+                                let idx = self.resolve_index(&item_id);
+                                self.add_args_len(&item_id, args.len());
+                                out.push(self.chunk(ChunkChoice {
+                                    index: 0,
+                                    delta: Some(Delta {
+                                        tool_calls: vec![ChunkToolCall {
+                                            index: idx,
+                                            function: Some(ChunkToolCallFunction {
+                                                arguments: Some(args),
                                                 ..Default::default()
-                                            }],
+                                            }),
                                             ..Default::default()
-                                        }),
-                                        finish_reason: None,
-                                    }));
-                                }
+                                        }],
+                                        ..Default::default()
+                                    }),
+                                    finish_reason: None,
+                                }));
                             }
                         }
                     }
@@ -367,10 +367,7 @@ pub fn translate_stream(
 ) -> impl futures::Stream<Item = Result<bytes::Bytes>> + Send {
     use futures::StreamExt;
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes>>(32);
-    let mapped = stream.map(|res| {
-        res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-            .map(|b| b)
-    });
+    let mapped = stream.map(|res| res.map_err(std::io::Error::other));
     let reader = tokio_util::io::StreamReader::new(mapped);
     let mut buf = tokio::io::BufReader::new(reader);
     let mut translator = StreamTranslator::new(model);

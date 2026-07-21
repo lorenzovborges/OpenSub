@@ -5,6 +5,8 @@ mod api;
 mod auth;
 mod codex;
 mod config;
+mod cursor_agent;
+mod cursor_proxy;
 mod translate;
 mod types;
 
@@ -22,7 +24,7 @@ use tracing_subscriber::EnvFilter;
     name = "opensub",
     version,
     about = "OpenAI-compatible API that routes to Codex via your ChatGPT subscription",
-    long_about = "OpenSub mirrors the OpenAI API and routes requests to the Codex backend,\nauthenticated with your ChatGPT (Plus/Pro) subscription via OAuth.\n\nCursor → Settings → Models → enable OpenAI API Key → set\n'Override OpenAI Base URL' to http://localhost:8788/v1 and any API key."
+    long_about = "OpenSub routes OpenAI model requests to the Codex backend, authenticated\nwith your ChatGPT (Plus/Pro) subscription via OAuth.\n\nFor transparent Cursor routing on macOS, quit Cursor and run:\n  opensub cursor proxy\n\nNo Cursor API key or base URL override is required."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -39,6 +41,11 @@ enum Command {
     Key {
         #[command(subcommand)]
         command: Option<KeyCommand>,
+    },
+    /// Route selected official Cursor model traffic through OpenSub.
+    Cursor {
+        #[command(subcommand)]
+        command: Option<CursorCommand>,
     },
     /// Probe the configured upstream with a minimal request (for debugging).
     Probe,
@@ -65,6 +72,17 @@ enum KeyCommand {
     Rotate,
 }
 
+#[derive(Subcommand)]
+enum CursorCommand {
+    /// Launch the official Cursor through OpenSub's selective local proxy.
+    Proxy {
+        /// Save the latest Agent request for protocol analysis. The capture may
+        /// contain prompt context and is stored locally with mode 0600.
+        #[arg(long)]
+        capture_protocol: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -88,11 +106,20 @@ async fn main() -> Result<()> {
         Some(Command::Login) => auth::login().await,
         Some(Command::Logout) => auth::logout(),
         Some(Command::Key { command }) => key_command(command),
+        Some(Command::Cursor { command }) => cursor_command(command).await,
         Some(Command::Probe) => {
             let tokens = auth::require_token().await?;
             codex::client::probe(&tokens).await
         }
         Some(Command::Serve { port, host, tunnel }) => serve(port, host, tunnel).await,
+    }
+}
+
+async fn cursor_command(command: Option<CursorCommand>) -> Result<()> {
+    match command.unwrap_or(CursorCommand::Proxy {
+        capture_protocol: false,
+    }) {
+        CursorCommand::Proxy { capture_protocol } => cursor_proxy::run(capture_protocol).await,
     }
 }
 

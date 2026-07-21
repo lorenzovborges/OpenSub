@@ -14,6 +14,7 @@ this when modifying the translation logic, the auth flow, or the streaming layer
 7. [Access control & the public tunnel](#7-access-control--the-public-tunnel)
 8. [Token lifecycle & refresh](#8-token-lifecycle--refresh)
 9. [Known limitations / gotchas](#9-known-limitations--gotchas)
+10. [Transparent Cursor Agent bridge](#10-transparent-cursor-agent-bridge)
 
 ---
 
@@ -274,7 +275,7 @@ bundled.)
   "refresh_token": "<opaque>",
   "id_token": "<JWT>",
   "expires_at": 1782870927,
-  "account_id": "fe874ce3-..."
+  "account_id": "<redacted>"
 }
 ```
 
@@ -284,7 +285,8 @@ bundled.)
 - **`ensure_valid_token()`** (called via `auth::require_token()` on each chat
   request) checks `expiring_within(300)` and refreshes proactively if the access
   token expires within 5 minutes. The refresh also re-persists the new tokens.
-- The probe confirmed a valid `account_id` was extracted (`fe874ce3-...`).
+- The probe confirmed that a valid `account_id` can be extracted. Values are
+  never written to repository documentation or request logs.
 
 ---
 
@@ -295,9 +297,56 @@ bundled.)
   requests preserve tools as-is, including custom/freeform tools. Only the
   legacy `messages[]` translation path drops non-`function` tools.
 - **Quick tunnel ephemeral.** URL rotates each restart.
+- **Conversation history is partial in transparent mode.** The bridge consumes
+  the current prompt and blobs prefetched in the initial Run request. It does
+  not actively fetch every referenced KV blob, so older turns omitted from the
+  prefetch may be unavailable to Codex.
 - **Tests are focused, not exhaustive.** Current unit tests cover Responses-shaped
   custom tools and tool-call SSE translation; broader recorded fixtures would
   still help.
-- **7 compiler warnings** (dead code/unused re-exports). Harmless; `cargo fix`
-  would clean the mechanical ones.
 - **ToS gray area** — same as any third-party ChatGPT-subscription client.
+
+---
+
+## 10. Transparent Cursor Agent bridge
+
+`opensub cursor proxy` uses mitmproxy Local Capture on macOS with a process
+filter limited to Cursor, Cursor Helper, and Cursor Helper (Plugin). The addon
+rewrites only `/agent.v1.AgentService/Run` to an ephemeral localhost Axum
+listener. A random per-process secret header prevents unrelated local callers
+from using that listener.
+
+The local bridge uses TLS with HTTP/2 ALPN because Cursor's Agent transport is a
+bidirectional Connect stream. OpenSub generates one private local CA, installs
+that exact certificate in the user's login Keychain, verifies both its SHA-256
+fingerprint and user trust settings, and passes it to Node-based Cursor helpers.
+The private key and generated capture files stay under
+`~/.opensub/cursor-proxy` with restrictive permissions.
+
+The Rust bridge reads the first Connect envelope incrementally, decompresses
+gzip when requested by the envelope flags, and parses only the protobuf fields
+needed to select a route:
+
+| Requested model | Destination |
+|---|---|
+| `gpt-*`, `o*`, `*codex*` | ChatGPT Codex Responses backend |
+| Composer, Grok, Claude, Gemini, unknown/future models | Original Cursor backend |
+
+Native requests and responses remain byte streams; they are not buffered. GPT
+requests are translated into Responses input. The addon enables streaming for
+both halves of `AgentService/Run`; response buffering would deadlock a tool turn
+because OpenSub waits for an `ExecClientMessage` while Cursor waits to receive
+the corresponding `ExecServerMessage`.
+
+Prefetched conversation blobs are folded into the Responses input, MCP
+definitions become Responses function tools, and core workspace operations
+become native `ExecServerMessage` requests. Local execution messages match
+Cursor's own mock Agent shape (`id` plus the selected args oneof, without a
+synthetic `exec_id`). Tool results returned as `ExecClientMessage` are fed into
+the next Responses round. Text deltas, tool lifecycle updates, token usage, and
+the Connect end-stream envelope are encoded back as `AgentServerMessage` frames.
+
+The bridge logs route metadata only. Prompt bodies, Cursor authorization
+headers, OAuth tokens, blob values, tool arguments, and tool outputs are not
+logged. The diagnostic `--capture-protocol` mode is explicit, stores its file
+with mode `0600`, and blocks the captured request before the Cursor backend.

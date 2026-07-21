@@ -115,7 +115,14 @@ pub async fn probe(tokens: &TokenData) -> Result<()> {
     }
     let resp = req.send().await.context("probe request failed")?;
     println!("→ upstream: {}", upstream);
-    println!("→ account_id: {:?}", tokens.account_id);
+    println!(
+        "→ account identity: {}",
+        if tokens.account_id.is_some() {
+            "available"
+        } else {
+            "unavailable"
+        }
+    );
     println!("→ status:   {}", resp.status());
 
     if !resp.status().is_success() {

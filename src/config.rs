@@ -44,7 +44,9 @@ pub fn api_key() -> String {
     if let Ok(k) = std::env::var("OPENSUB_API_KEY") {
         return k;
     }
-    if let Ok(k) = std::fs::read_to_string(api_key_file()) {
+    let path = api_key_file();
+    if let Ok(k) = std::fs::read_to_string(&path) {
+        let _ = enforce_private_file(&path);
         return k.trim().to_string();
     }
     // Generate and persist a key on first run.
@@ -63,7 +65,7 @@ pub fn rotate_api_key() -> std::io::Result<String> {
 fn generate_api_key() -> String {
     use base64::Engine;
     let mut bytes = [0u8; 24];
-    use rand::RngCore;
+    use rand::Rng;
     rand::rng().fill_bytes(&mut bytes);
     format!(
         "sk-opensub-{}",
@@ -72,20 +74,44 @@ fn generate_api_key() -> String {
 }
 
 fn write_api_key(key: &str) -> std::io::Result<()> {
-    std::fs::create_dir_all(data_dir())?;
+    ensure_private_data_dir()?;
     let path = api_key_file();
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
     file.write_all(key.as_bytes())?;
     file.write_all(b"\n")?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        enforce_private_file(&path)?;
     }
+    Ok(())
+}
+
+pub fn ensure_private_data_dir() -> std::io::Result<PathBuf> {
+    let dir = data_dir();
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir)
+}
+
+#[cfg(unix)]
+fn enforce_private_file(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn enforce_private_file(_path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -190,7 +216,7 @@ pub fn session_id() -> &'static str {
     SESSION_ID.get_or_init(|| {
         use base64::Engine;
         let mut bytes = [0u8; 16];
-        use rand::RngCore;
+        use rand::Rng;
         rand::rng().fill_bytes(&mut bytes);
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     })

@@ -19,7 +19,7 @@ pub struct Pkce {
 
 /// Generate a PKCE pair (S256), matching opencode's alphabet and length.
 pub fn generate_pkce() -> Pkce {
-    use rand::RngCore;
+    use rand::Rng;
     // opencode: 43 random bytes mapped via `byte % 64` into `A-Za-z0-9-._~`.
     let chars: Vec<char> = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
         .chars()
@@ -40,7 +40,7 @@ pub fn generate_pkce() -> Pkce {
 
 /// Generate a random `state` (32 bytes, base64url-no-pad) — matches Codex CLI.
 pub fn generate_state() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)

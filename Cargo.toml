@@ -16,6 +16,12 @@ tokio-stream = "0.1"
 axum = { version = "0.8", features = ["json"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 bytes = "1"
+hudsucker = { version = "0.25", features = ["http2"] }
+http-body-util = "0.1"
+jsonc-parser = { version = "0.33", features = ["serde"] }
+rcgen = "0.14"
+flate2 = "1"
+tokio-rustls = "0.26"
 
 # Serde
 serde = { version = "1", features = ["derive"] }

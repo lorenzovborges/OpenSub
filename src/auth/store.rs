@@ -1,6 +1,6 @@
 //! Token storage: `~/.opensub/auth.json` with mode 0600.
 
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -67,6 +67,11 @@ pub fn load() -> Result<Option<TokenData>> {
     if !p.exists() {
         return Ok(None);
     }
+    crate::config::ensure_private_data_dir()?;
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+    }
     let raw = std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
     let mut data: TokenData =
         serde_json::from_str(&raw).with_context(|| format!("parse {}", p.display()))?;
@@ -77,9 +82,7 @@ pub fn load() -> Result<Option<TokenData>> {
 /// Save tokens to disk with mode 0600.
 pub fn save(data: &TokenData) -> Result<()> {
     let p = path();
-    if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
+    crate::config::ensure_private_data_dir()?;
     let json = serde_json::to_string_pretty(data)?;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true).mode(0o600);
@@ -89,6 +92,7 @@ pub fn save(data: &TokenData) -> Result<()> {
     use std::io::Write;
     f.write_all(json.as_bytes())
         .with_context(|| format!("write {}", p.display()))?;
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 

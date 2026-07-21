@@ -14,14 +14,15 @@ your ChatGPT (Plus/Pro) **subscription** as if it were an OpenAI API key. It
 works by:
 
 1. Logging you in with the same ChatGPT OAuth flow OpenCode uses (`opensub login`).
-2. Serving an OpenAI-shaped API (`/v1/models`, `/v1/chat/completions`) on
-   localhost (`opensub serve`).
-3. **Translating** Chat Completions ↔ the Codex backend's Responses API.
-4. Exposing itself over a public Cloudflare tunnel (`--tunnel`) because Cursor's
-   cloud blocks private network addresses.
+2. Transparently intercepting the official Cursor Agent stream with
+   `opensub cursor proxy` and routing only OpenAI-family models to Codex.
+3. **Translating** both Cursor Connect/protobuf and OpenAI Chat Completions to
+   the Codex backend's Responses API.
+4. Keeping `opensub serve [--tunnel]` as an OpenAI-compatible endpoint for
+   other clients.
 
-**Current status: functionally complete, end-to-end verified up to the point
-where the request reaches Cursor's tool-format expectations.** See "State" below.
+**Current status: text and native workspace tools are end-to-end verified in
+the official Cursor application.** See "State" below.
 
 ---
 
@@ -78,6 +79,20 @@ auth** (middleware) so the now-public endpoint can't be abused.
    (`web_search`, etc.). Our strict `ChatTool` type rejected them. Fix: made
    `ChatTool` a newtype over raw JSON; only `function`-type tools are forwarded.
 
+### Transparent Agent bridge bugs fixed during live validation
+1. **HTTP/1 local hop dropped the bidirectional request body.** The bridge now
+   terminates TLS with HTTP/2 ALPN and receives Cursor's Connect stream intact.
+2. **Certificate present but not trusted.** The startup check used to accept any
+   matching Keychain certificate. It now verifies the exact SHA-256 fingerprint
+   plus user trust settings and installs the CA in the user trust domain.
+3. **Tool execution targeted a nonexistent executor.** OpenSub populated
+   `ExecServerMessage.exec_id` with the model call ID. Cursor's local executor
+   expects the same shape as its mock Agent: numeric `id` plus the args oneof,
+   without a synthetic `exec_id`.
+4. **mitmproxy buffered Agent responses.** This deadlocked tools: OpenSub waited
+   for `ExecClientMessage` while Cursor waited for `ExecServerMessage`. The addon
+   now streams both request and response halves of `AgentService/Run`.
+
 ---
 
 ## State
@@ -87,7 +102,7 @@ auth** (middleware) so the now-public endpoint can't be abused.
 - OAuth login (`opensub login`) — works, tokens persisted at `~/.opensub/auth.json`.
 - Lazy token refresh (`ensure_valid_token`, 5-min window).
 - `opensub probe` — confirmed **200** from the ChatGPT/Codex backend with a real
-  `account_id` extracted (`fe874ce3-...`).
+  `account_id` extraction verified (value intentionally redacted).
 - API server with `/v1/models`, `/v1/chat/completions` (+ `/v1`-less aliases).
 - API-key middleware (auto-generated key, `opensub key` to view).
 - Chat Completions → Responses request translation (messages, tool_calls, tools).
@@ -97,22 +112,31 @@ auth** (middleware) so the now-public endpoint can't be abused.
   `custom_tool_call` deltas).
 - **Incremental streaming** via `mpsc` + `Body::from_stream` (no more broken pipe).
 - Cloudflare tunnel integration (`--tunnel`).
+- mitmproxy Local Capture verified against the official Cursor process tree.
+- Real `AgentService/Run` capture decoded: Connect framing, gzip protobuf,
+  requested model, reasoning parameter, 75 MCP tools, KV blobs, and Exec flow.
+- Transparent selective bridge implemented: OpenAI model IDs route to Codex;
+  Composer, Grok, Claude, Gemini, and unknown models pass through to Cursor.
+- Agent text stream, prefetched conversation-blob ingestion, MCP/core tool
+  execution loop, token usage, and Connect end-stream encoding implemented in
+  Rust.
+- Live official-Cursor text turns route to OpenSub and complete.
+- Live workspace-tool turn verified with `read_file`, `shell`, `list_dir`, and
+  `grep`; every request received a matching result and the generation completed.
+- Local CA trust, HTTP/2 transport, bidirectional response streaming, and native
+  Exec protobuf shapes are covered by startup checks and focused tests.
+- The legacy managed Cursor copy and its hidden CLI commands were removed after
+  the transparent bridge passed validation.
 - README + ARCHITECTURE docs.
 
-### 🟡 In progress / not yet confirmed
-- **End-to-end Cursor agent/tools test after the custom-tool fix.** The proxy now
-  accepts Responses-shaped Cursor bodies, preserves custom tools, sends Codex
-  session headers, and translates `custom_tool_call` events. `cargo test` and
-  `opensub probe` pass, but Cursor still needs a live retest. The next step is
-  `cargo install --path . --force`, restart `opensub serve --tunnel`, and
-  confirm Cursor can actually execute an edit/tool turn.
-- The broken-pipe fix similarly needs a live streaming confirmation through the
-  tunnel (text should now arrive progressively).
+### 🟡 Known limitation
+- Transparent mode currently uses the current prompt plus blobs prefetched by
+  Cursor. Active fetching of every referenced historical KV blob is not yet
+  implemented, so some older conversation context may be absent.
 
 ### ❌ Not done (future work)
 - Broader unit tests with recorded SSE fixtures.
 - Stable/named Cloudflare tunnel (so the URL doesn't rotate on restart).
-- `cargo fix` to clear the 8 dead-code warnings.
 - Broader error mapping (429 pass-through, nicer 401 "please re-login" message).
 - Device-code (headless) login flow — currently browser-only.
 
@@ -120,22 +144,19 @@ auth** (middleware) so the now-public endpoint can't be abused.
 
 ## Immediate next steps (do these first)
 
-1. **Rebuild and retest in Cursor** (this is the real validation):
+1. **Quit Cursor completely and start the transparent proxy:**
    ```bash
    cd ~/CursorOpenSub
    cargo install --path . --force
-   opensub serve --tunnel
+   opensub cursor proxy
    ```
-   Copy the new `https://*.trycloudflare.com/v1` URL and the API key into
-   Cursor, send a test message. If it streams text → 🎉 the core works.
-2. If Cursor's agent mode is the goal, test a tool-calling turn and watch the
-   logs (`RUST_LOG=opensub=debug`) to confirm `function_call` deltas flow back.
-3. If a new error appears, the two most likely culprits are:
-   - the SSE event names (`response.function_call_arguments.delta` etc.) not
-     matching what the backend actually emits — cross-check against
-     `docs/ARCHITECTURE.md` §5 and add any missing events to the translator.
-   - `tool_calls[].index` correlation — Cursor is picky about per-call indexing;
-     `StreamTranslator::call_indices` must stay consistent.
+   Leave Cursor's OpenAI API key and base URL overrides disabled.
+2. Use Cursor normally. For diagnosis, inspect the metadata-only
+   `~/.opensub/cursor-proxy/events.jsonl`; a healthy tool turn includes
+   `route_opensub`, `tool_requested`, `tool_completed`, and
+   `generation_completed`.
+3. Select Composer or Grok for a passthrough check. It should produce
+   `route_cursor` and continue using the Cursor subscription.
 
 ---
 
@@ -153,9 +174,12 @@ opensub login
 # debug the upstream anytime
 opensub probe
 
-# run for Cursor
+# recommended: transparent official Cursor routing
+# Cursor must be fully closed before this command
+opensub cursor proxy
+
+# optional OpenAI-compatible endpoint for other clients
 opensub serve --tunnel
-# → note the trycloudflare URL + API key, put both in Cursor
 ```
 
 Sandbox note: this project was developed with a tool harness whose shell/filesystem
@@ -176,6 +200,8 @@ mysteriously fails, retry — it's environmental, not the code.
 | OAuth callback server (:1455) | `src/auth/callback.rs` |
 | Router, API-key middleware, chat handler | `src/api/mod.rs` |
 | Upstream HTTP client + probe | `src/codex/client.rs` |
+| Transparent Cursor Connect/protobuf bridge | `src/cursor_agent.rs` |
+| macOS process capture, TLS, CA trust, routing addon | `src/cursor_proxy.rs` |
 | Chat→Responses request translation | `src/translate/request.rs` |
 | Responses→Chat SSE translation + incremental stream | `src/translate/stream.rs` |
 | Type definitions | `src/types/{chat,responses}.rs` |
@@ -186,10 +212,8 @@ User-facing docs: `README.md`. Deep technical: `docs/ARCHITECTURE.md`.
 
 ## One-line summary for the next agent
 
-> OpenSub (Rust, `~/CursorOpenSub`) is a working OpenAI-compatible proxy that
-> routes Cursor to a ChatGPT subscription via the Codex backend, presenting as
-> OpenCode. OAuth, translation, incremental streaming, tunnel, and API-key auth
-> are all implemented and verified up to a `tools[7]: missing field function`
-> bug that was just fixed — **the next step is `cargo install --path . --force`
-> and a live Cursor retest.** Read `docs/ARCHITECTURE.md` for the translation
-> internals before touching `translate/`.
+> OpenSub (Rust, `~/CursorOpenSub`) transparently routes OpenAI-family models
+> from the official Cursor app to the ChatGPT Codex backend while native models
+> stay on Cursor. OAuth, HTTP/2 Connect transport, incremental bidirectional
+> streaming, text generation, and native workspace tools are live-verified;
+> read `docs/ARCHITECTURE.md` before changing protocol or translation code.

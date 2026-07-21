@@ -33,14 +33,14 @@ pub fn translate(req: &ChatCompletionRequest) -> Result<ResponsesRequest> {
             }
             "assistant" => {
                 // Emit any prior text content first.
-                if let Some(text) = content_to_string(&msg.content) {
-                    if !text.trim().is_empty() {
-                        out.input.push(ResponseInputItem::Message {
-                            kind: "message".to_string(),
-                            role: "assistant".to_string(),
-                            content: vec![MessageContent::output(text)],
-                        });
-                    }
+                if let Some(text) = content_to_string(&msg.content)
+                    && !text.trim().is_empty()
+                {
+                    out.input.push(ResponseInputItem::Message {
+                        kind: "message".to_string(),
+                        role: "assistant".to_string(),
+                        content: vec![MessageContent::output(text)],
+                    });
                 }
                 // Then any tool calls the assistant made.
                 for tc in &msg.tool_calls {
@@ -107,10 +107,10 @@ pub fn translate(req: &ChatCompletionRequest) -> Result<ResponsesRequest> {
         );
         out.tools.push(serde_json::Value::Object(tool));
     }
-    if let Some(tc) = &req.tool_choice {
-        if let Some(s) = tc.as_str() {
-            out.tool_choice = s.to_string();
-        }
+    if let Some(tc) = &req.tool_choice
+        && let Some(s) = tc.as_str()
+    {
+        out.tool_choice = s.to_string();
     }
 
     out.instructions = instructions;
