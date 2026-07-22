@@ -149,8 +149,9 @@ auth** (middleware) so the now-public endpoint can't be abused.
   in Cursor through field 11.
 - Native Task/subagent relay implemented: OpenSub translates the Task schema and
   protobuf lifecycle while Cursor's harness owns subagent creation and execution.
-  An explicit Task model wins; otherwise the subagent inherits the parent Cursor
-  model and reasoning variant instead of falling back to Cursor Auto. A clean
+  The subagent always inherits the parent Cursor model and reasoning variant;
+  Task-generated aliases such as `fast` or `auto` cannot override it. The same
+  effective model is sent in the execution and display protobufs. A clean
   release probe confirms `gpt-5.6-sol` is accepted and returned by the
   ChatGPT/Codex backend. Focused tests pass; the corrected live child model still
   needs fresh validation.

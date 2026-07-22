@@ -1152,13 +1152,12 @@ fn core_tools() -> Vec<Value> {
         ),
         function_tool(
             "task",
-            "Delegate a task to a Cursor subagent. Cursor creates and runs the subagent in its own harness.",
+            "Delegate a task to a Cursor subagent. Cursor creates and runs the subagent in its own harness, inheriting the current model and reasoning mode.",
             json!({
                 "type":"object", "properties": {
                     "description":{"type":"string"},
                     "prompt":{"type":"string"},
                     "subagent_type":{"type":"string"},
-                    "model":{"type":"string"},
                     "resume":{"type":"string"},
                     "readonly":{"type":"boolean"},
                     "run_in_background":{"type":"boolean"}
@@ -1639,7 +1638,7 @@ impl ToolExecution {
         };
         let native_display_args = match exec_field {
             7 => Some(read_display_args(&arguments)?),
-            28 => Some(task_display_args(&arguments)?),
+            28 => Some(task_display_args(&arguments, default_subagent_model)?),
             _ => None,
         };
         let display_args = native_display_args.as_deref().unwrap_or(&args);
@@ -2165,7 +2164,10 @@ fn subagent_args(
         2,
         required_string(arguments, "subagent_type")?.as_bytes(),
     );
-    if let Some(model) = optional_string(arguments, "model").or(default_model) {
+    // The model that produced the Task call may suggest generic aliases such as
+    // "fast". Cursor subagents spawned by OpenSub must inherit the model and
+    // reasoning mode selected for their parent request.
+    if let Some(model) = default_model.or_else(|| optional_string(arguments, "model")) {
         push_bytes_field(&mut args, 3, model.as_bytes());
     }
     push_bytes_field(
@@ -2197,7 +2199,7 @@ fn subagent_args(
     Ok(args)
 }
 
-fn task_display_args(arguments: &Value) -> Result<Vec<u8>> {
+fn task_display_args(arguments: &Value, default_model: Option<&str>) -> Result<Vec<u8>> {
     let mut args = Vec::new();
     push_bytes_field(
         &mut args,
@@ -2211,10 +2213,11 @@ fn task_display_args(arguments: &Value) -> Result<Vec<u8>> {
     );
     let subagent_type = subagent_type_message(required_string(arguments, "subagent_type")?);
     push_bytes_field(&mut args, 3, &subagent_type);
-    for (field, key) in [(4, "model"), (5, "resume")] {
-        if let Some(value) = optional_string(arguments, key) {
-            push_bytes_field(&mut args, field, value.as_bytes());
-        }
+    if let Some(model) = default_model.or_else(|| optional_string(arguments, "model")) {
+        push_bytes_field(&mut args, 4, model.as_bytes());
+    }
+    if let Some(resume) = optional_string(arguments, "resume") {
+        push_bytes_field(&mut args, 5, resume.as_bytes());
     }
     Ok(args)
 }
@@ -3847,6 +3850,7 @@ mod tests {
         let display_args = WireMessage::parse(task_call.bytes(1).unwrap()).unwrap();
         let subagent_type = WireMessage::parse(display_args.bytes(3).unwrap()).unwrap();
         assert!(subagent_type.bytes(4).is_some());
+        assert_eq!(display_args.string(4).unwrap(), Some("gpt-5.6-sol-xhigh"));
     }
 
     #[test]
@@ -3904,7 +3908,25 @@ mod tests {
     }
 
     #[test]
-    fn explicit_subagent_model_overrides_parent_model() {
+    fn parent_model_overrides_model_suggested_by_task_call() {
+        let args = subagent_args(
+            &json!({
+                "prompt": "Inspect the repository.",
+                "subagent_type": "explore",
+                "model": "fast"
+            }),
+            "call-task",
+            Some("parent"),
+            Some("gpt-5.6-sol-xhigh"),
+        )
+        .unwrap();
+        let args = WireMessage::parse(&args).unwrap();
+
+        assert_eq!(args.string(3).unwrap(), Some("gpt-5.6-sol-xhigh"));
+    }
+
+    #[test]
+    fn explicit_subagent_model_is_preserved_without_a_parent_default() {
         let args = subagent_args(
             &json!({
                 "prompt": "Inspect the repository.",
@@ -3913,7 +3935,7 @@ mod tests {
             }),
             "call-task",
             Some("parent"),
-            Some("gpt-5.6-sol"),
+            None,
         )
         .unwrap();
         let args = WireMessage::parse(&args).unwrap();

@@ -485,13 +485,15 @@ without a synthetic `exec_id`). Tool results returned as `ExecClientMessage`
 are fed into the next Responses round. Text deltas, tool lifecycle updates, token usage, and
 the Connect end-stream envelope are encoded back as `AgentServerMessage` frames.
 
-`SubagentArgs.model_id` uses the Task call's explicit `model` when present. If
-the call omits it, OpenSub copies the parent Cursor model plus reasoning
-variant, such as `gpt-5.6-sol-xhigh`; leaving this protobuf field empty makes
-Cursor select Auto. Parent effort is accepted from `reasoning`, `effort`,
-`reasoning_effort`, or a model suffix. OpenAI-family child requests pass through
-the same selective interception path, while an explicitly selected native model
-remains on Cursor's backend.
+`SubagentArgs.model_id` always copies the parent Cursor model plus reasoning
+variant, such as `gpt-5.6-sol-xhigh`. The Task schema exposed upstream does not
+offer a model selector, and any extra `model` value produced by a call is ignored
+while a parent model is available. This prevents generic aliases such as `fast`
+or `auto` from silently moving an OpenSub child back to Cursor's backend. The
+same inherited ID is encoded in the Task display arguments so the UI reports the
+model that actually executes. Parent effort is accepted from `reasoning`,
+`effort`, `reasoning_effort`, or a model suffix. The OpenAI-family child then
+passes through the same selective interception path.
 
 Agent turns have no fixed local tool-round limit. The loop continues until the
 model emits no tool call, the upstream fails, or Cursor closes the execution

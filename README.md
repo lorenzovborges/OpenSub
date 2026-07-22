@@ -137,11 +137,11 @@ from the upstream model ID and sent as `reasoning.effort`. Unknown OpenAI-family
 IDs fall back to `gpt-5.5`. Set `OPENSUB_CURSOR_MODEL` before running
 `opensub cursor proxy` to force a specific upstream model.
 
-Cursor subagents inherit the parent's Cursor model and reasoning variant when
-the Task call does not choose one explicitly. For example, a parent using
-`gpt-5.6-sol` at Extra High creates the child with `gpt-5.6-sol-xhigh`. An
-explicit Task model still takes precedence. A child using an OpenAI-family
-model is intercepted by OpenSub like any other Agent run.
+Cursor subagents always inherit the parent's Cursor model and reasoning
+variant. For example, a parent using `gpt-5.6-sol` at Extra High creates the
+child with `gpt-5.6-sol-xhigh`. Model aliases suggested inside a Task call,
+including `fast` or `auto`, cannot override that selection. The OpenAI-family
+child is intercepted by OpenSub like any other Agent run.
 
 ## Service lifecycle
 
