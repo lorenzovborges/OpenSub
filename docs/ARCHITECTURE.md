@@ -444,6 +444,19 @@ request. It is bounded to 32 conversations, 64 turns per conversation, and 2 MiB
 per conversation. Oversized turns retain only user/assistant message items. No
 prompt or tool content from this cache is persisted or logged.
 
+The action oneof has three supported forms on the OpenAI route:
+
+| Action field | Meaning | Translation |
+|---|---|---|
+| `1` | user message | current user prompt plus its supplied runtime context |
+| `2` | continue/resume | synthetic continuation prompt using cached/transcript context |
+| `12` | async task/process updates | bounded textual results, status, agent ID, and call ID fed back to the parent |
+
+Async and resume actions often omit `UserMessage.context`. The cache therefore
+also retains the latest MCP catalog, workspace instructions, and trusted
+transcript path for the conversation. Async payloads are capped at 256 KiB in
+total and 64 KiB per result before they enter a Responses request.
+
 The bridge also resolves the transcript directory from the Cursor environment
 inside `UserMessage.context`. Main-agent transcripts are located by
 `conversation_id`; subagent transcripts use parent field 16 and its `subagents`
@@ -500,6 +513,22 @@ model emits no tool call, the upstream fails, or Cursor closes the execution
 stream. Because `parallel_tool_calls` is disabled, one round normally
 corresponds to one tool execution. A buggy model can therefore loop and consume
 subscription usage until the request is cancelled.
+
+Context growth is managed independently of the tool-round count. Before a
+request reaches roughly 180k reported input tokens or 640 KiB of serialized
+history/instructions/tools, the bridge calls the canonical Codex
+`POST /responses/compact` endpoint with the same model, tools, reasoning effort,
+and prompt cache key. The returned compacted output replaces the working input.
+If `/responses` still reports `context_length_exceeded`, the bridge compacts and
+retries the round. If the compact endpoint itself rejects an oversized input,
+up to four attempts progressively remove the oldest complete history unit while
+preserving the active prompt. A successful operation emits only the
+metadata-only `context_compacted` event.
+
+Generation failures use a Connect end-stream frame with a structured error
+payload. They are not emitted as assistant text followed by a successful
+`turn_ended`, which prevents Cursor from treating a failed request as a normal
+completed answer.
 
 The bridge logs route metadata only. Prompt bodies, Cursor authorization
 headers, OAuth tokens, blob values, tool arguments, and tool outputs are not

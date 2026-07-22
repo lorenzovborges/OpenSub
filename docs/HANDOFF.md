@@ -105,6 +105,15 @@ auth** (middleware) so the now-public endpoint can't be abused.
    finished unregistering the old job, so an immediate bootstrap could fail
    with error 5. Lifecycle code now waits for the service registration itself
    to disappear before bootstrapping the replacement.
+8. **Async subagent results lost parent context.** Cursor sends completed
+   background tasks through action field 12 and continuation through field 2,
+   often without a new `UserMessage.context`. OpenSub now parses both action
+   forms and caches the MCP catalog, instructions, and transcript path by
+   conversation so the parent can continue with the actual child result.
+9. **Long tool runs exceeded the Codex context.** A captured run completed 110
+   tools and then failed with `context_length_exceeded`. OpenSub now uses the
+   Codex `/responses/compact` endpoint proactively and as a recovery retry, and
+   reports unrecoverable failures as structured Connect terminal errors.
 
 ---
 
@@ -161,9 +170,17 @@ auth** (middleware) so the now-public endpoint can't be abused.
 - Local CA trust, HTTP/2 transport, bidirectional response streaming, and native
   Exec protobuf shapes are covered by startup checks and focused tests.
 - Native-model routing no longer requires the action to contain a user message.
+- OpenAI routing accepts user, resume, and async task/process action variants.
+  Async child results are returned to the parent with bounded payloads while
+  cached runtime context restores omitted instructions and MCP schemas.
+- Long Agent histories are compacted remotely with the same model, tools, and
+  reasoning configuration. Both a proactive size/token threshold and a
+  `context_length_exceeded` recovery path are covered by focused tests.
+- Failed generations terminate with a structured Connect error instead of an
+  assistant error sentence followed by a normal completion.
 - `cursor stop` remains disabled across macOS logins until an explicit start.
 - Dependency cleanup reduced the release binary to approximately 4.1 MB; the
-  current suite contains 43 passing tests and Clippy passes with warnings denied.
+  current suite contains 50 passing tests and Clippy passes with warnings denied.
 - The legacy managed Cursor copy and its hidden CLI commands were removed after
   the transparent bridge passed validation.
 - README + ARCHITECTURE docs.
@@ -180,8 +197,8 @@ auth** (middleware) so the now-public endpoint can't be abused.
   fetched. Text from main-agent and subagent history is recovered from Cursor's
   local transcript when available, including after a worker restart, but an old
   tool result with no later textual summary may need to be fetched again.
-- The latest native internal-action routing fix is covered by a focused unit
-  test but still needs a fresh live Cursor passthrough validation.
+- Async/resume parsing and context compaction are covered by focused tests but
+  still need a fresh long live Cursor task after installing the current worker.
 - The native `AskQuestion` field 7 / client field 6 interaction is documented by
   the trace but is not yet emitted by OpenSub; the model can still ask in text.
 

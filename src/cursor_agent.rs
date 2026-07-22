@@ -47,6 +47,12 @@ const MAX_CURSOR_INSTRUCTIONS_BYTES: usize = 256 * 1024;
 const MAX_TRANSCRIPT_READ_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_TRANSCRIPT_MESSAGES: usize = 128;
 const MAX_TRANSCRIPT_CONTEXT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ASYNC_UPDATE_BYTES: usize = 256 * 1024;
+const MAX_ASYNC_RESULT_BYTES: usize = 64 * 1024;
+const AUTO_COMPACT_INPUT_TOKENS: u64 = 180_000;
+const AUTO_COMPACT_CONTEXT_BYTES: usize = 640 * 1024;
+const MAX_COMPACTION_ATTEMPTS: u32 = 4;
+const MAX_CONTEXT_RECOVERY_ATTEMPTS: u32 = 4;
 
 pub struct TlsListener {
     listener: TcpListener,
@@ -248,6 +254,14 @@ struct CachedConversation {
     turns: VecDeque<CachedTurn>,
     bytes: usize,
     updated_at_ms: u128,
+    runtime: Option<CachedRuntimeContext>,
+}
+
+#[derive(Clone, Default)]
+struct CachedRuntimeContext {
+    mcp_tools: Vec<McpTool>,
+    instructions: String,
+    transcript_path: Option<PathBuf>,
 }
 
 struct CachedTurn {
@@ -309,6 +323,33 @@ impl ConversationCache {
             };
             conversation.bytes = conversation.bytes.saturating_sub(removed.bytes);
         }
+    }
+
+    fn runtime_snapshot(&self, conversation_id: &str) -> Option<CachedRuntimeContext> {
+        self.conversations
+            .lock()
+            .ok()?
+            .get(conversation_id)?
+            .runtime
+            .clone()
+    }
+
+    fn remember_runtime(&self, conversation_id: String, runtime: CachedRuntimeContext) {
+        let Ok(mut conversations) = self.conversations.lock() else {
+            return;
+        };
+        if !conversations.contains_key(&conversation_id)
+            && conversations.len() >= MAX_CACHED_CONVERSATIONS
+            && let Some(oldest) = conversations
+                .iter()
+                .min_by_key(|(_, conversation)| conversation.updated_at_ms)
+                .map(|(id, _)| id.clone())
+        {
+            conversations.remove(&oldest);
+        }
+        let conversation = conversations.entry(conversation_id).or_default();
+        conversation.runtime = Some(runtime);
+        conversation.updated_at_ms = now_ms();
     }
 }
 
@@ -691,24 +732,12 @@ async fn openai_response(
                     json!({"message": format!("{error:#}")}),
                 );
             }
-            let message = text_delta_frame(
-                "OpenSub could not complete this request. Check the proxy terminal for details.",
-            );
-            let _ = send_cursor_frame(&tx, trace.as_ref(), request_id, "error_text", message).await;
             let _ = send_cursor_frame(
                 &tx,
                 trace.as_ref(),
                 request_id,
-                "turn_ended",
-                turn_ended_frame(None),
-            )
-            .await;
-            let _ = send_cursor_frame(
-                &tx,
-                trace.as_ref(),
-                request_id,
-                "end_stream",
-                end_stream_frame(),
+                "error_end_stream",
+                connect_error_frame(&user_facing_generation_error(&error)),
             )
             .await;
         } else {
@@ -740,14 +769,46 @@ async fn stream_openai_agent(
     let upstream_model = map_cursor_model(&agent.requested_model);
     let inherited_subagent_model =
         model_with_reasoning_variant(&agent.requested_model, agent.reasoning_effort.as_deref());
-    let conversation = load_conversation_material(&agent);
+    let cached_runtime = agent
+        .conversation_id
+        .as_deref()
+        .and_then(|id| conversations.runtime_snapshot(id));
+    let transcript_path = agent.transcript_path.as_deref().or_else(|| {
+        cached_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.transcript_path.as_deref())
+    });
+    let mut conversation = load_conversation_material(&agent, transcript_path);
+    if conversation.instructions.is_empty()
+        && let Some(runtime) = &cached_runtime
+    {
+        conversation.instructions.clone_from(&runtime.instructions);
+    }
+    let available_mcp_tools = if agent.mcp_tools.is_empty() {
+        cached_runtime
+            .as_ref()
+            .map(|runtime| runtime.mcp_tools.clone())
+            .unwrap_or_default()
+    } else {
+        agent.mcp_tools.clone()
+    };
+    if let Some(conversation_id) = &agent.conversation_id {
+        conversations.remember_runtime(
+            conversation_id.clone(),
+            CachedRuntimeContext {
+                mcp_tools: available_mcp_tools.clone(),
+                instructions: conversation.instructions.clone(),
+                transcript_path: transcript_path.map(Path::to_path_buf),
+            },
+        );
+    }
     let mut input = conversation.input;
     if input.is_empty()
         && let Some(conversation_id) = &agent.conversation_id
     {
         input = conversations.snapshot(conversation_id);
     }
-    let turn_start = input.len();
+    let mut turn_start = input.len();
     let current_prompt = agent.prompt.clone();
     input.push(json!({
         "type": "message",
@@ -765,27 +826,57 @@ async fn stream_openai_agent(
     if !conversation.instructions.trim().is_empty() {
         instructions.push(conversation.instructions);
     }
-    if !agent.mcp_tools.is_empty() {
-        instructions.push(mcp_catalog_instruction(&agent.mcp_tools));
+    if !available_mcp_tools.is_empty() {
+        instructions.push(mcp_catalog_instruction(&available_mcp_tools));
     }
     let mut tools = core_tools();
-    if !agent.mcp_tools.is_empty() {
+    if !available_mcp_tools.is_empty() {
         tools.extend(mcp_meta_tools());
     }
-    let mcp_tools = agent
-        .mcp_tools
+    let mcp_tools = available_mcp_tools
         .iter()
         .map(|tool| (tool.name.clone(), tool))
         .collect::<HashMap<_, _>>();
     let mut exec_sequence = 1u32;
     let mut total_usage = Usage::default();
     let mut round_number = 0u32;
+    let instructions = instructions.join("\n\n");
+    let prompt_cache_key = agent
+        .conversation_id
+        .as_deref()
+        .unwrap_or(config::session_id());
+    let reasoning_effort = agent
+        .reasoning_effort
+        .as_deref()
+        .and_then(|effort| map_reasoning_effort(effort, &upstream_model));
+    let mut compact_before_next_round = context_needs_compaction(&input, &instructions, &tools);
+    let mut compaction_number = 0u32;
+    let mut context_recovery_attempts = 0u32;
 
     loop {
+        if compact_before_next_round && input.len() > 1 {
+            compaction_number = compaction_number.saturating_add(1);
+            input = compact_responses_history(
+                &tokens,
+                &upstream_model,
+                &input,
+                &instructions,
+                &tools,
+                reasoning_effort,
+                prompt_cache_key,
+                trace.as_ref(),
+                request_id,
+                compaction_number,
+            )
+            .await?;
+            turn_start = 0;
+            compact_before_next_round = false;
+            events.record("context_compacted", Some(&upstream_model));
+        }
         round_number = round_number.saturating_add(1);
         let mut body = json!({
             "model": upstream_model,
-            "instructions": instructions.join("\n\n"),
+            "instructions": instructions,
             "input": input,
             "tools": tools,
             "tool_choice": "auto",
@@ -794,17 +885,13 @@ async fn stream_openai_agent(
             "stream": true,
             "include": ["reasoning.encrypted_content"],
             "service_tier": "priority",
-            "prompt_cache_key": agent.conversation_id.as_deref().unwrap_or(config::session_id()),
+            "prompt_cache_key": prompt_cache_key,
         });
-        if let Some(effort) = agent
-            .reasoning_effort
-            .as_deref()
-            .and_then(|effort| map_reasoning_effort(effort, &upstream_model))
-        {
+        if let Some(effort) = reasoning_effort {
             body["reasoning"] = json!({"effort": effort});
         }
 
-        let round = stream_responses_round(
+        let round = match stream_responses_round(
             &tokens,
             &body,
             &tx,
@@ -812,14 +899,49 @@ async fn stream_openai_agent(
             request_id,
             round_number,
         )
-        .await?;
+        .await
+        {
+            Ok(round) => round,
+            Err(error)
+                if is_context_length_error(&error)
+                    && input.len() > 1
+                    && context_recovery_attempts < MAX_CONTEXT_RECOVERY_ATTEMPTS =>
+            {
+                context_recovery_attempts = context_recovery_attempts.saturating_add(1);
+                compaction_number = compaction_number.saturating_add(1);
+                input = compact_responses_history(
+                    &tokens,
+                    &upstream_model,
+                    &input,
+                    &instructions,
+                    &tools,
+                    reasoning_effort,
+                    prompt_cache_key,
+                    trace.as_ref(),
+                    request_id,
+                    compaction_number,
+                )
+                .await
+                .context("failed to recover an oversized Cursor conversation")?;
+                turn_start = 0;
+                compact_before_next_round = false;
+                events.record("context_compacted", Some(&upstream_model));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        context_recovery_attempts = 0;
         if let Some(usage) = round.usage {
             total_usage.add(usage);
+            compact_before_next_round = usage.input >= AUTO_COMPACT_INPUT_TOKENS;
         }
         input.extend(round.output_items);
         if round.tool_calls.is_empty() {
             if let Some(conversation_id) = &agent.conversation_id {
-                conversations.commit(conversation_id.clone(), input[turn_start..].to_vec());
+                conversations.commit(
+                    conversation_id.clone(),
+                    input[turn_start.min(input.len())..].to_vec(),
+                );
             }
             send_cursor_frame(
                 &tx,
@@ -844,7 +966,7 @@ async fn stream_openai_agent(
             tracing::debug!(tool = %call.name, "Cursor tool execution requested");
             events.record("tool_requested", Some(&call.name));
             if call.name == "GetMcpTools" {
-                let output = discover_mcp_tools(&call.arguments, &agent.mcp_tools)?;
+                let output = discover_mcp_tools(&call.arguments, &available_mcp_tools)?;
                 events.record("tool_completed", Some(&call.name));
                 input.push(json!({
                     "type": "function_call_output",
@@ -893,6 +1015,142 @@ async fn stream_openai_agent(
                 "output": result.output_text,
             }));
         }
+        compact_before_next_round |= context_needs_compaction(&input, &instructions, &tools);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn compact_responses_history(
+    tokens: &crate::auth::store::TokenData,
+    model: &str,
+    input: &[Value],
+    instructions: &str,
+    tools: &[Value],
+    reasoning_effort: Option<&str>,
+    prompt_cache_key: &str,
+    trace: Option<&Arc<ProtocolTrace>>,
+    request_id: u64,
+    compaction_number: u32,
+) -> Result<Vec<Value>> {
+    let mut candidate = input.to_vec();
+    for attempt in 1..=MAX_COMPACTION_ATTEMPTS {
+        let body = compact_request_body(
+            model,
+            &candidate,
+            instructions,
+            tools,
+            reasoning_effort,
+            prompt_cache_key,
+        );
+        if let Some(trace) = trace {
+            trace.record_json(
+                request_id,
+                "opensub_to_codex",
+                "compact_request",
+                json!({
+                    "compaction": compaction_number,
+                    "attempt": attempt,
+                    "body": body,
+                }),
+            );
+        }
+        match codex::client::post_responses_compact(tokens, &body).await {
+            Ok(output) => {
+                if let Some(trace) = trace {
+                    trace.record_json(
+                        request_id,
+                        "codex_to_opensub",
+                        "compact_response",
+                        json!({
+                            "compaction": compaction_number,
+                            "attempt": attempt,
+                            "output": output,
+                        }),
+                    );
+                }
+                tracing::info!(
+                    compaction = compaction_number,
+                    attempt,
+                    input_items = candidate.len(),
+                    output_items = output.len(),
+                    "Cursor Agent context compacted"
+                );
+                return Ok(output);
+            }
+            Err(error)
+                if attempt < MAX_COMPACTION_ATTEMPTS
+                    && candidate.len() > 1
+                    && is_context_length_error(&error) =>
+            {
+                drop_oldest_history_unit(&mut candidate);
+            }
+            Err(error) => return Err(error).context("Codex context compaction failed"),
+        }
+    }
+    bail!("Codex context compaction exhausted its retry budget")
+}
+
+fn compact_request_body(
+    model: &str,
+    input: &[Value],
+    instructions: &str,
+    tools: &[Value],
+    reasoning_effort: Option<&str>,
+    prompt_cache_key: &str,
+) -> Value {
+    let mut body = json!({
+        "model": model,
+        "instructions": instructions,
+        "input": input,
+        "tools": tools,
+        "parallel_tool_calls": false,
+        "service_tier": "priority",
+        "prompt_cache_key": prompt_cache_key,
+    });
+    if let Some(effort) = reasoning_effort {
+        body["reasoning"] = json!({"effort": effort});
+    }
+    body
+}
+
+fn context_needs_compaction(input: &[Value], instructions: &str, tools: &[Value]) -> bool {
+    serialized_items_len(input)
+        .saturating_add(instructions.len())
+        .saturating_add(serialized_items_len(tools))
+        >= AUTO_COMPACT_CONTEXT_BYTES
+}
+
+fn is_context_length_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    message.contains("context_length_exceeded")
+        || message.contains("context length")
+        || message.contains("maximum context")
+        || message.contains("too many tokens")
+}
+
+fn drop_oldest_history_unit(input: &mut Vec<Value>) {
+    if input.len() <= 1 {
+        return;
+    }
+    let removed_call_id = input
+        .first()
+        .filter(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call" | "custom_tool_call")
+            )
+        })
+        .and_then(|item| item.get("call_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    input.remove(0);
+    if let Some(call_id) = removed_call_id
+        && input.first().is_some_and(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                && item.get("call_id").and_then(Value::as_str) == Some(call_id.as_str())
+        })
+    {
+        input.remove(0);
     }
 }
 
@@ -1297,7 +1555,10 @@ struct ConversationMaterial {
     input: Vec<Value>,
 }
 
-fn load_conversation_material(agent: &AgentRequest) -> ConversationMaterial {
+fn load_conversation_material(
+    agent: &AgentRequest,
+    transcript_path: Option<&Path>,
+) -> ConversationMaterial {
     tracing::debug!(
         root_prompts = agent.root_prompt_messages_json.len(),
         history_messages = agent.history.len(),
@@ -1324,9 +1585,7 @@ fn load_conversation_material(agent: &AgentRequest) -> ConversationMaterial {
     instruction_parts.retain(|part| !part.trim().is_empty());
     material.instructions = instruction_parts.join("\n\n");
     material.input = if agent.history.is_empty() {
-        agent
-            .transcript_path
-            .as_deref()
+        transcript_path
             .map(|path| load_transcript_history(path, &agent.prompt))
             .unwrap_or_default()
     } else {
@@ -2507,20 +2766,33 @@ fn should_forward_response_header(name: &HeaderName) -> bool {
 }
 
 fn connect_error_response(message: &str) -> Response {
-    let body = connect_envelope(
-        0x02,
-        json!({
-            "error": {"code": "internal", "message": message}
-        })
-        .to_string()
-        .as_bytes(),
-    );
+    let body = connect_error_frame(message);
     (
         StatusCode::OK,
         [("content-type", "application/connect+proto")],
         body,
     )
         .into_response()
+}
+
+fn connect_error_frame(message: &str) -> Bytes {
+    connect_envelope(
+        0x02,
+        json!({
+            "error": {"code": "internal", "message": message}
+        })
+        .to_string()
+        .as_bytes(),
+    )
+}
+
+fn user_facing_generation_error(error: &anyhow::Error) -> String {
+    if is_context_length_error(error) {
+        "OpenSub could not compact this conversation after it reached the model context limit. Start a new Cursor conversation or check the proxy log for the compaction error."
+            .to_string()
+    } else {
+        "OpenSub could not complete this request. Check the proxy terminal for details.".to_string()
+    }
 }
 
 #[derive(Debug)]
@@ -2616,22 +2888,34 @@ impl AgentRequest {
             run.bytes(2)
                 .ok_or_else(|| anyhow!("Agent run request has no action"))?,
         )?;
-        let user_action = WireMessage::parse(
-            action
-                .bytes(1)
-                .ok_or_else(|| anyhow!("Agent action is not a user message"))?,
-        )?;
-        let user_message = WireMessage::parse(
-            user_action
-                .bytes(1)
-                .ok_or_else(|| anyhow!("Agent user action has no message"))?,
-        )?;
-        let prompt = user_message_text(&user_message, &prefetched_blobs)?.unwrap_or_default();
-        let user_context = user_action
-            .bytes(2)
-            .map(WireMessage::parse)
-            .transpose()?
-            .unwrap_or(WireMessage { fields: Vec::new() });
+        let (prompt, user_context) = if let Some(raw_user_action) = action.bytes(1) {
+            let user_action = WireMessage::parse(raw_user_action)?;
+            let user_message = WireMessage::parse(
+                user_action
+                    .bytes(1)
+                    .ok_or_else(|| anyhow!("Agent user action has no message"))?,
+            )?;
+            let prompt = user_message_text(&user_message, &prefetched_blobs)?.unwrap_or_default();
+            let context = user_action
+                .bytes(2)
+                .map(WireMessage::parse)
+                .transpose()?
+                .unwrap_or(WireMessage { fields: Vec::new() });
+            (prompt, context)
+        } else if let Some(raw_updates) = action.bytes(12) {
+            (
+                async_update_prompt(raw_updates)?,
+                WireMessage { fields: Vec::new() },
+            )
+        } else if action.bytes(2).is_some() {
+            (
+                "Continue the current Cursor task from its existing conversation and transcript context."
+                    .to_string(),
+                WireMessage { fields: Vec::new() },
+            )
+        } else {
+            bail!("unsupported Cursor Agent action")
+        };
         let mcp_server_ids = cursor_mcp_server_ids(&user_context);
         let mut mcp_tools = user_context
             .all_bytes(7)
@@ -2670,6 +2954,53 @@ impl AgentRequest {
             transcript_path,
         })
     }
+}
+
+fn async_update_prompt(raw: &[u8]) -> Result<String> {
+    let updates = WireMessage::parse(raw)?;
+    let mut sections = Vec::new();
+    let mut total_bytes = 0usize;
+    for raw_update in updates.all_bytes(1) {
+        let update = WireMessage::parse(raw_update)?;
+        let title = update.string(4)?.unwrap_or("Cursor background task");
+        let result = update.string(5)?.unwrap_or_default();
+        let agent_id = update.string(9)?.or(update.string(1)?).unwrap_or_default();
+        let call_id = update.string(10)?.unwrap_or_default();
+        let status = match update.varint(3) {
+            Some(1) => "completed",
+            Some(2) => "failed",
+            Some(3) => "aborted",
+            Some(_) => "updated",
+            None => "updated",
+        };
+        let result = truncate_utf8_bytes(result, MAX_ASYNC_RESULT_BYTES);
+        let section = format!(
+            "Title: {title}\nStatus: {status}\nAgent ID: {agent_id}\nCall ID: {call_id}\nResult:\n{result}"
+        );
+        if total_bytes.saturating_add(section.len()) > MAX_ASYNC_UPDATE_BYTES {
+            break;
+        }
+        total_bytes = total_bytes.saturating_add(section.len());
+        sections.push(section);
+    }
+    if sections.is_empty() {
+        return Ok("Cursor reported an asynchronous task update with no textual result. Continue the current task from the transcript context.".to_string());
+    }
+    Ok(format!(
+        "Cursor delivered asynchronous task and process updates. Incorporate these results into the current task and continue from the existing conversation context.\n\n{}",
+        sections.join("\n\n---\n\n")
+    ))
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut boundary = max_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary = boundary.saturating_sub(1);
+    }
+    &value[..boundary]
 }
 
 fn cursor_mcp_server_ids(context: &WireMessage<'_>) -> HashMap<String, String> {
@@ -2986,7 +3317,7 @@ fn parse_requested_model(run: &WireMessage<'_>) -> Result<(String, Option<String
     bail!("Agent run request has no model ID")
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct McpTool {
     name: String,
     provider: String,
@@ -3331,7 +3662,7 @@ mod tests {
     }
 
     #[test]
-    fn native_model_routing_does_not_require_a_user_action() {
+    fn native_model_routing_accepts_a_resume_action() {
         let requested_model = message(&[(1, b"grok-4.5")]);
         let non_user_action = message(&[(2, b"internal-action")]);
         let run_request = message(&[(2, &non_user_action), (9, &requested_model)]);
@@ -3343,7 +3674,8 @@ mod tests {
         assert_eq!(model, "grok-4.5");
         assert_eq!(reasoning, None);
         assert!(!is_openai_model(&model));
-        assert!(AgentRequest::parse(&run, model, reasoning).is_err());
+        let agent = AgentRequest::parse(&run, model, reasoning).unwrap();
+        assert!(agent.prompt.contains("Continue the current Cursor task"));
     }
 
     #[test]
@@ -3389,7 +3721,7 @@ mod tests {
         let run = WireMessage::parse(&run_request).unwrap();
 
         let agent = AgentRequest::parse(&run, "gpt-5.5".to_string(), None).unwrap();
-        let material = load_conversation_material(&agent);
+        let material = load_conversation_material(&agent, None);
 
         assert_eq!(agent.prompt, "What token did I ask you to remember?");
         assert_eq!(agent.conversation_id.as_deref(), Some("conversation-123"));
@@ -3463,6 +3795,128 @@ mod tests {
     }
 
     #[test]
+    fn conversation_cache_preserves_runtime_for_async_actions() {
+        let cache = ConversationCache::default();
+        let runtime = CachedRuntimeContext {
+            mcp_tools: vec![McpTool {
+                name: "linear_list_issues".to_string(),
+                provider: "linear".to_string(),
+                server_id: "plugin-linear-linear".to_string(),
+                tool_name: "list_issues".to_string(),
+                description: Some("List issues".to_string()),
+                parameters: json!({"type":"object"}),
+            }],
+            instructions: "Follow the workspace rules.".to_string(),
+            transcript_path: Some(PathBuf::from("/tmp/transcript.jsonl")),
+        };
+        cache.remember_runtime("conversation-1".to_string(), runtime);
+
+        let snapshot = cache.runtime_snapshot("conversation-1").unwrap();
+
+        assert_eq!(snapshot.mcp_tools.len(), 1);
+        assert_eq!(snapshot.mcp_tools[0].name, "linear_list_issues");
+        assert_eq!(snapshot.instructions, "Follow the workspace rules.");
+        assert_eq!(
+            snapshot.transcript_path.as_deref(),
+            Some(Path::new("/tmp/transcript.jsonl"))
+        );
+    }
+
+    #[test]
+    fn agent_request_parses_async_task_updates() {
+        let update = message(&[
+            (1, b"agent-7"),
+            (4, b"Review the implementation"),
+            (5, b"The review completed without findings."),
+            (9, b"subagent-7"),
+            (10, b"call-7"),
+        ]);
+        let mut update_with_status = update;
+        push_varint_field(&mut update_with_status, 3, 1);
+        let updates = message(&[(1, &update_with_status)]);
+        let action = message(&[(12, &updates)]);
+        let requested_model = message(&[(1, b"gpt-5.6-sol")]);
+        let run_request = message(&[
+            (2, &action),
+            (5, b"conversation-async"),
+            (9, &requested_model),
+        ]);
+        let run = WireMessage::parse(&run_request).unwrap();
+
+        let agent = AgentRequest::parse(&run, "gpt-5.6-sol".to_string(), None).unwrap();
+
+        assert!(agent.prompt.contains("Review the implementation"));
+        assert!(agent.prompt.contains("Status: completed"));
+        assert!(agent.prompt.contains("subagent-7"));
+        assert!(agent.prompt.contains("call-7"));
+        assert!(
+            agent
+                .prompt
+                .contains("The review completed without findings.")
+        );
+    }
+
+    #[test]
+    fn agent_request_parses_resume_action() {
+        let resume = message(&[(1, b"resume")]);
+        let action = message(&[(2, &resume)]);
+        let requested_model = message(&[(1, b"gpt-5.6-sol")]);
+        let run_request = message(&[
+            (2, &action),
+            (5, b"conversation-resume"),
+            (9, &requested_model),
+        ]);
+        let run = WireMessage::parse(&run_request).unwrap();
+
+        let agent = AgentRequest::parse(&run, "gpt-5.6-sol".to_string(), None).unwrap();
+
+        assert!(agent.prompt.contains("Continue the current Cursor task"));
+        assert_eq!(
+            agent.conversation_id.as_deref(),
+            Some("conversation-resume")
+        );
+    }
+
+    #[test]
+    fn compact_request_preserves_model_tools_and_reasoning() {
+        let input = vec![history_message("user", "Continue".to_string())];
+        let tools = vec![function_tool(
+            "shell",
+            "Run a command",
+            json!({"type":"object"}),
+        )];
+
+        let body = compact_request_body(
+            "gpt-5.6-sol",
+            &input,
+            "System instructions",
+            &tools,
+            Some("xhigh"),
+            "conversation-1",
+        );
+
+        assert_eq!(body["model"], "gpt-5.6-sol");
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
+        assert_eq!(body["tools"][0]["name"], "shell");
+        assert_eq!(body["prompt_cache_key"], "conversation-1");
+        assert!(body.get("stream").is_none());
+        assert!(body.get("store").is_none());
+    }
+
+    #[test]
+    fn context_size_triggers_preemptive_compaction() {
+        let oversized = "x".repeat(AUTO_COMPACT_CONTEXT_BYTES);
+        let input = vec![history_message("user", oversized)];
+
+        assert!(context_needs_compaction(&input, "", &[]));
+        assert!(!context_needs_compaction(
+            &[history_message("user", "small".to_string())],
+            "",
+            &[]
+        ));
+    }
+
+    #[test]
     fn preserves_supported_reasoning_effort_for_gpt_5_5() {
         assert_eq!(map_reasoning_effort("none", "gpt-5.5"), Some("none"));
         assert_eq!(map_reasoning_effort("minimal", "gpt-5.5"), Some("low"));
@@ -3524,6 +3978,17 @@ mod tests {
         let parsed = first_connect_frame(&frame).unwrap().unwrap();
         assert_eq!(parsed.flags, 0);
         assert_eq!(parsed.payload, b"payload");
+    }
+
+    #[test]
+    fn generation_error_is_a_structured_connect_end_stream() {
+        let frame = connect_error_frame("request failed");
+        let parsed = first_connect_frame(&frame).unwrap().unwrap();
+        let payload = serde_json::from_slice::<Value>(parsed.payload).unwrap();
+
+        assert_eq!(parsed.flags, 0x02);
+        assert_eq!(payload["error"]["code"], "internal");
+        assert_eq!(payload["error"]["message"], "request failed");
     }
 
     #[test]

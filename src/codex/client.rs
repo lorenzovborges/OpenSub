@@ -2,7 +2,9 @@
 
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
+use serde::Deserialize;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use crate::auth::store::TokenData;
 use crate::config;
@@ -70,6 +72,61 @@ pub async fn post_responses_stream(
     tracing::debug!(status = %status, "stream opened from upstream");
 
     Ok(Box::pin(resp.bytes_stream()))
+}
+
+#[derive(Deserialize)]
+struct CompactResponse {
+    output: Vec<serde_json::Value>,
+}
+
+/// Compact a Responses history through the Codex backend's canonical endpoint.
+pub async fn post_responses_compact(
+    tokens: &TokenData,
+    body: &serde_json::Value,
+) -> Result<Vec<serde_json::Value>> {
+    let client = codex_client()?;
+    let upstream = config::validated_upstream()?;
+    let url = format!("{}/responses/compact", upstream.trim_end_matches('/'));
+    let prompt_cache_key = body
+        .get("prompt_cache_key")
+        .and_then(|value| value.as_str())
+        .unwrap_or_else(|| config::session_id());
+    let req = client
+        .post(&url)
+        .timeout(Duration::from_secs(180))
+        .header("Authorization", format!("Bearer {}", tokens.access_token))
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/json")
+        .header("openai-beta", "responses=experimental")
+        .header("session_id", prompt_cache_key)
+        .header("x-codex-installation-id", config::session_id())
+        .json(body);
+    let req = if config::is_chatgpt_upstream_url(&upstream) {
+        let mut request = req;
+        if let Some(account_id) = &tokens.account_id {
+            request = request.header("chatgpt-account-id", account_id);
+        }
+        request.header("originator", "codex_cli_rs")
+    } else {
+        req
+    };
+    let response = req.send().await.context("POST /responses/compact failed")?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        bail!(
+            "compact upstream returned {status}: {}",
+            truncate(&text, 500)
+        );
+    }
+    let compacted = response
+        .json::<CompactResponse>()
+        .await
+        .context("invalid /responses/compact response")?;
+    if compacted.output.is_empty() {
+        bail!("/responses/compact returned an empty history");
+    }
+    Ok(compacted.output)
 }
 
 /// A cheap helper to format error bodies without dumping megabytes.

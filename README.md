@@ -64,6 +64,14 @@ retain text history across worker restarts and after native-model turns. Exact
 historical tool-result payloads are still best-effort and may need to be
 re-read by the model.
 
+Cursor can continue a task without sending a new user message. OpenSub handles
+both resume actions and asynchronous task/process updates, restores the cached
+workspace instructions and MCP catalog, and feeds completed subagent results
+back into the parent conversation. Long tool-heavy turns are compacted through
+the Codex `/responses/compact` endpoint before they exceed the model context;
+an upstream `context_length_exceeded` also triggers one recovery compaction and
+retry path.
+
 ## Requirements
 
 Transparent Cursor mode requires:
@@ -411,6 +419,22 @@ OpenSub does not impose a fixed tool-round limit. A turn continues while the
 model requests tools and ends when the model returns a final response, an
 upstream error occurs, or Cursor closes the stream. Cancel the request in
 Cursor if the model enters a repetitive tool loop.
+
+### A long task fails with `context_length_exceeded`
+
+Current builds compact large Agent histories automatically and retry when the
+Codex backend reports a context-limit error. Reinstall and restart OpenSub if an
+older worker is still active:
+
+```bash
+cargo install --path . --locked --force
+opensub cursor proxy
+```
+
+Successful compaction records `context_compacted` in
+`~/.opensub/cursor-proxy/events.jsonl`. If compacting itself fails, Cursor
+receives a terminal protocol error instead of a normal-looking completed turn;
+inspect `service-error.log` for the upstream reason.
 
 ### `Network disconnected` or `ERR_CERT_AUTHORITY_INVALID`
 
