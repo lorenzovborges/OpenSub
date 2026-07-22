@@ -420,6 +420,20 @@ model requests tools and ends when the model returns a final response, an
 upstream error occurs, or Cursor closes the stream. Cancel the request in
 Cursor if the model enters a repetitive tool loop.
 
+### Messages reappear after the Agent already stopped
+
+Update OpenSub. Older bridge builds could leave Cursor's bidirectional request
+half open after sending `turnEnded` and the Connect response trailer. The UI
+looked finished, but Cursor eventually timed out the RPC and retried the same
+request, causing duplicate messages and tool calls. Current builds stop the
+client-stream reader as soon as the response finishes so the HTTP/2 RPC closes
+normally.
+
+```bash
+cargo install --path . --locked --force
+opensub cursor proxy
+```
+
 ### A long task fails with `context_length_exceeded`
 
 Current builds compact large Agent histories automatically and retry when the

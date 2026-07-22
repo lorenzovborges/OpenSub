@@ -114,6 +114,12 @@ auth** (middleware) so the now-public endpoint can't be abused.
    tools and then failed with `context_length_exceeded`. OpenSub now uses the
    Codex `/responses/compact` endpoint proactively and as a recovery retry, and
    reports unrecoverable failures as structured Connect terminal errors.
+10. **Completed turns reappeared as a retry loop.** OpenSub sent `turnEnded` and
+    the correct Connect `{}` trailer but left the task reading Cursor's
+    bidirectional upload alive. The UI stopped while `rpc.run` remained pending;
+    after roughly 90 seconds Cursor retried the same request ID and duplicated
+    text/tools. The generation now signals the client-stream reader to stop
+    immediately after the response trailer, allowing the HTTP/2 RPC to close.
 
 ---
 
@@ -180,7 +186,7 @@ auth** (middleware) so the now-public endpoint can't be abused.
   assistant error sentence followed by a normal completion.
 - `cursor stop` remains disabled across macOS logins until an explicit start.
 - Dependency cleanup reduced the release binary to approximately 4.1 MB; the
-  current suite contains 50 passing tests and Clippy passes with warnings denied.
+  current suite contains 52 passing tests and Clippy passes with warnings denied.
 - The legacy managed Cursor copy and its hidden CLI commands were removed after
   the transparent bridge passed validation.
 - README + ARCHITECTURE docs.

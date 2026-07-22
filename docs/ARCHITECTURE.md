@@ -530,6 +530,13 @@ payload. They are not emitted as assistant text followed by a successful
 `turn_ended`, which prevents Cursor from treating a failed request as a normal
 completed answer.
 
+`AgentService/Run` is bidirectional: while OpenSub streams responses, a separate
+task reads Cursor's request half for tool results. Cursor intentionally keeps
+that upload half open during the turn. After OpenSub sends the final Connect
+trailer, it explicitly stops the reader, dropping the request body so mitmproxy
+and HTTP/2 can close the RPC. Leaving the reader pending makes Cursor receive
+`turnEnded` in the UI but later mark `rpc.run` as failed and retry the same Run.
+
 The bridge logs route metadata only. Prompt bodies, Cursor authorization
 headers, OAuth tokens, blob values, tool arguments, and tool outputs are not
 logged. The diagnostic `--capture-protocol` mode is explicit, stores its file

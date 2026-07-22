@@ -28,7 +28,7 @@ use futures::{StreamExt, TryStreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 use tokio_util::io::StreamReader;
@@ -554,10 +554,12 @@ async fn route_request(state: BridgeState, request: Request) -> Result<Response>
     let first_frame_len = frame.payload.len() + 5;
     let initial_remainder = initial[first_frame_len..].to_vec();
     let (client_tx, client_rx) = mpsc::channel(32);
+    let (client_stop, client_stopped) = oneshot::channel();
     tokio::spawn(read_client_stream(
         initial_remainder,
         incoming,
         client_tx,
+        client_stopped,
         state.trace.clone(),
         request_id,
     ));
@@ -569,6 +571,7 @@ async fn route_request(state: BridgeState, request: Request) -> Result<Response>
         Arc::clone(&state.conversations),
         state.trace.clone(),
         request_id,
+        client_stop,
     )
     .await)
 }
@@ -701,6 +704,29 @@ async fn send_cursor_frame(
     Ok(())
 }
 
+fn agent_response_stream(
+    rx: mpsc::Receiver<Result<Bytes, Infallible>>,
+    client_stop: oneshot::Sender<()>,
+) -> impl futures::Stream<Item = Result<Bytes, Infallible>> {
+    futures::stream::unfold(
+        (rx, Some(client_stop)),
+        |(mut rx, mut client_stop)| async move {
+            match rx.recv().await {
+                Some(frame) => Some((frame, (rx, client_stop))),
+                None => {
+                    // Cursor keeps the request half open for tool results. Stop
+                    // it only after every response frame has drained so HTTP/2
+                    // can close the completed RPC without replaying it.
+                    if let Some(client_stop) = client_stop.take() {
+                        let _ = client_stop.send(());
+                    }
+                    None
+                }
+            }
+        },
+    )
+}
+
 async fn openai_response(
     agent: AgentRequest,
     client_rx: mpsc::Receiver<ClientMessage>,
@@ -708,6 +734,7 @@ async fn openai_response(
     conversations: Arc<ConversationCache>,
     trace: Option<Arc<ProtocolTrace>>,
     request_id: u64,
+    client_stop: oneshot::Sender<()>,
 ) -> Response {
     let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(32);
     tokio::spawn(async move {
@@ -745,13 +772,15 @@ async fn openai_response(
         }
     });
 
+    let stream = agent_response_stream(rx, client_stop);
+
     (
         StatusCode::OK,
         [
             ("content-type", "application/connect+proto"),
             ("cache-control", "no-store"),
         ],
-        Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+        Body::from_stream(stream),
     )
         .into_response()
 }
@@ -1765,6 +1794,7 @@ async fn read_client_stream<S>(
     mut buffer: Vec<u8>,
     incoming: S,
     tx: mpsc::Sender<ClientMessage>,
+    mut stopped: oneshot::Receiver<()>,
     trace: Option<Arc<ProtocolTrace>>,
     request_id: u64,
 ) where
@@ -1794,7 +1824,11 @@ async fn read_client_stream<S>(
             buffer.drain(..frame_len);
         }
 
-        match incoming.next().await {
+        let next = tokio::select! {
+            _ = &mut stopped => return,
+            next = incoming.next() => next,
+        };
+        match next {
             Some(Ok(chunk)) => buffer.extend_from_slice(&chunk),
             Some(Err(_)) | None => return,
         }
@@ -3989,6 +4023,43 @@ mod tests {
         assert_eq!(parsed.flags, 0x02);
         assert_eq!(payload["error"]["code"], "internal");
         assert_eq!(payload["error"]["message"], "request failed");
+    }
+
+    #[tokio::test]
+    async fn client_stream_reader_stops_after_response_completion() {
+        let incoming = futures::stream::pending::<Result<Bytes, axum::Error>>();
+        let (tx, _rx) = mpsc::channel(1);
+        let (stop, stopped) = oneshot::channel();
+        let reader = tokio::spawn(read_client_stream(
+            Vec::new(),
+            incoming,
+            tx,
+            stopped,
+            None,
+            1,
+        ));
+
+        stop.send(()).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), reader)
+            .await
+            .expect("client stream reader did not stop")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn response_stream_stops_client_reader_only_after_frames_drain() {
+        let (tx, rx) = mpsc::channel(1);
+        let (stop, mut stopped) = oneshot::channel();
+        tx.send(Ok(Bytes::from_static(b"frame"))).await.unwrap();
+        drop(tx);
+        let mut stream = Box::pin(agent_response_stream(rx, stop));
+
+        assert!(stopped.try_recv().is_err());
+        assert_eq!(stream.next().await.unwrap().unwrap(), b"frame"[..]);
+        assert!(stopped.try_recv().is_err());
+        assert!(stream.next().await.is_none());
+        stopped.await.unwrap();
     }
 
     #[test]
