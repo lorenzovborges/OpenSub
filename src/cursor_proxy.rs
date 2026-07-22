@@ -82,7 +82,7 @@ struct CursorServiceState {
     ready_at_ms: u64,
 }
 
-pub async fn ensure_service() -> Result<()> {
+pub async fn ensure_service(trace: bool, native_trace: bool) -> Result<()> {
     require_macos()?;
     require_official_cursor()?;
     let mitmdump = require_mitmdump()?;
@@ -95,7 +95,7 @@ pub async fn ensure_service() -> Result<()> {
         .context("failed to locate the OpenSub executable")?
         .canonicalize()
         .context("failed to resolve the OpenSub executable")?;
-    let plist = service_plist(&executable, &mitmdump)?;
+    let plist = service_plist(&executable, &mitmdump, trace, native_trace)?;
     let plist_path = service_plist_path()?;
     set_service_enabled(true)?;
     let installed_current = fs::read(&plist_path).is_ok_and(|current| current == plist.as_bytes());
@@ -104,6 +104,21 @@ pub async fn ensure_service() -> Result<()> {
     if healthy {
         println!("→ Cursor proxy service: active");
         println!("→ Starts automatically at login.");
+        if trace {
+            println!(
+                "→ Full protocol trace: {}",
+                crate::cursor_agent::protocol_trace_path().display()
+            );
+            println!("→ Warning: the trace contains prompts, code, and tool results.");
+        }
+        if native_trace {
+            println!("→ Routing mode: official Cursor passthrough (OpenSub disabled).");
+            println!(
+                "→ Native Cursor trace: {}",
+                crate::cursor_agent::native_protocol_trace_path().display()
+            );
+            println!("→ Warning: the trace contains prompts, code, and tool results.");
+        }
         if !cursor_is_running() {
             launch_cursor_direct(&cert_path)?;
             println!("→ Official Cursor launched.");
@@ -137,6 +152,21 @@ pub async fn ensure_service() -> Result<()> {
     }
     println!("→ Cursor proxy service: installed and active");
     println!("→ Starts automatically at login.");
+    if trace {
+        println!(
+            "→ Full protocol trace: {}",
+            crate::cursor_agent::protocol_trace_path().display()
+        );
+        println!("→ Warning: the trace contains prompts, code, and tool results.");
+    }
+    if native_trace {
+        println!("→ Routing mode: official Cursor passthrough (OpenSub disabled).");
+        println!(
+            "→ Native Cursor trace: {}",
+            crate::cursor_agent::native_protocol_trace_path().display()
+        );
+        println!("→ Warning: the trace contains prompts, code, and tool results.");
+    }
     println!("→ No terminal needs to stay open.");
     Ok(())
 }
@@ -147,6 +177,8 @@ pub fn service_status() -> Result<()> {
     let loaded = service_is_loaded()?;
     let enabled = service_is_enabled()?;
     let ready = loaded && service_is_ready();
+    let trace = service_trace_enabled()?;
+    let native_trace = service_native_trace_enabled()?;
     println!(
         "→ Cursor proxy service: {}",
         if ready {
@@ -166,6 +198,19 @@ pub fn service_status() -> Result<()> {
             println!("→ Disabled until `opensub cursor proxy` is run.");
         }
         println!("→ Logs: {}", service_log_path().display());
+        if trace {
+            println!(
+                "→ Full protocol trace: {}",
+                crate::cursor_agent::protocol_trace_path().display()
+            );
+        }
+        if native_trace {
+            println!("→ Routing mode: official Cursor passthrough (OpenSub disabled).");
+            println!(
+                "→ Native Cursor trace: {}",
+                crate::cursor_agent::native_protocol_trace_path().display()
+            );
+        }
     }
     Ok(())
 }
@@ -187,6 +232,8 @@ pub fn service_uninstall() -> Result<()> {
     remove_file_if_present(&service_plist_path()?)?;
     remove_file_if_present(&service_log_path())?;
     remove_file_if_present(&service_error_log_path())?;
+    remove_file_if_present(&crate::cursor_agent::protocol_trace_path())?;
+    remove_file_if_present(&crate::cursor_agent::native_protocol_trace_path())?;
     set_service_enabled(true)?;
     println!("→ Cursor proxy service uninstalled.");
     println!("→ OAuth tokens and the local CA were kept.");
@@ -196,11 +243,13 @@ pub fn service_uninstall() -> Result<()> {
 pub async fn run_diagnostic() -> Result<()> {
     require_macos()?;
     let restart_service = service_plist_path()?.exists();
+    let restart_trace = service_trace_enabled()?;
+    let restart_native_trace = service_native_trace_enabled()?;
     bootout_service()?;
     remove_service_state_if_present()?;
     let result = run_capture(true, true, false).await;
     if restart_service {
-        let restart = ensure_service().await;
+        let restart = ensure_service(restart_trace, restart_native_trace).await;
         result.and(restart)
     } else {
         result
@@ -424,7 +473,24 @@ fn service_plist_path() -> Result<PathBuf> {
         .join(SERVICE_PLIST_NAME))
 }
 
-fn service_plist(executable: &Path, mitmdump: &Path) -> Result<String> {
+fn service_trace_enabled() -> Result<bool> {
+    let path = service_plist_path()?;
+    Ok(fs::read_to_string(path)
+        .is_ok_and(|plist| plist.contains("<key>OPENSUB_CURSOR_TRACE</key>")))
+}
+
+fn service_native_trace_enabled() -> Result<bool> {
+    let path = service_plist_path()?;
+    Ok(fs::read_to_string(path)
+        .is_ok_and(|plist| plist.contains("<key>OPENSUB_CURSOR_NATIVE_TRACE</key>")))
+}
+
+fn service_plist(
+    executable: &Path,
+    mitmdump: &Path,
+    trace: bool,
+    native_trace: bool,
+) -> Result<String> {
     let home = std::env::var("HOME").context("HOME is not set")?;
     let executable_hash = hex_sha256(&fs::read(executable)?);
     let mut environment = vec![
@@ -443,6 +509,12 @@ fn service_plist(executable: &Path, mitmdump: &Path) -> Result<String> {
         ),
         ("NO_COLOR".to_string(), "1".to_string()),
     ];
+    if trace {
+        environment.push(("OPENSUB_CURSOR_TRACE".to_string(), "1".to_string()));
+    }
+    if native_trace {
+        environment.push(("OPENSUB_CURSOR_NATIVE_TRACE".to_string(), "1".to_string()));
+    }
     for name in [
         "OPENSUB_HOME",
         "OPENSUB_CURSOR_MODEL",
@@ -662,8 +734,11 @@ fn bootout_service() -> Result<()> {
         );
     }
     let deadline = Instant::now() + Duration::from_secs(10);
-    while service_is_ready() && Instant::now() < deadline {
+    while service_is_loaded()? && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(100));
+    }
+    if service_is_loaded()? {
+        bail!("Cursor proxy service did not finish unloading within 10 seconds");
     }
     Ok(())
 }
@@ -1223,7 +1298,7 @@ mod tests {
     #[test]
     fn launch_agent_runs_persistent_hidden_worker() {
         let executable = std::env::current_exe().unwrap();
-        let plist = service_plist(&executable, Path::new("/tmp/mitm&dump")).unwrap();
+        let plist = service_plist(&executable, Path::new("/tmp/mitm&dump"), false, false).unwrap();
         assert!(plist.contains("<string>cursor</string>"));
         assert!(plist.contains("<string>worker</string>"));
         assert!(plist.contains("<key>RunAtLoad</key>"));
@@ -1231,6 +1306,15 @@ mod tests {
         assert!(plist.contains("/tmp/mitm&amp;dump"));
         assert!(!plist.contains("auth.json"));
         assert!(!plist.contains("access_token"));
+
+        let trace_plist =
+            service_plist(&executable, Path::new("/tmp/mitmdump"), true, false).unwrap();
+        assert!(trace_plist.contains("<key>OPENSUB_CURSOR_TRACE</key>"));
+        assert!(trace_plist.contains("<string>1</string>"));
+
+        let native_trace_plist =
+            service_plist(&executable, Path::new("/tmp/mitmdump"), false, true).unwrap();
+        assert!(native_trace_plist.contains("<key>OPENSUB_CURSOR_NATIVE_TRACE</key>"));
     }
 
     #[test]

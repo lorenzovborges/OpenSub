@@ -91,7 +91,11 @@ fn truncate(s: &str, n: usize) -> String {
 /// The ChatGPT/Codex backend requires `stream: true`, so this always streams
 /// and prints the first chunk of SSE events.
 pub async fn probe(tokens: &TokenData) -> Result<()> {
-    let body = ResponsesRequest::new("gpt-5.5".to_string());
+    let model = std::env::var("OPENSUB_CURSOR_MODEL")
+        .ok()
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or_else(|| "gpt-5.5".to_string());
+    let body = ResponsesRequest::new(model.clone());
     // minimal input
     let mut body = body;
     body.instructions = "You are a test.".to_string();
@@ -127,6 +131,7 @@ pub async fn probe(tokens: &TokenData) -> Result<()> {
     }
     let resp = req.send().await.context("probe request failed")?;
     println!("→ upstream: {}", upstream);
+    println!("→ model:    {model}");
     println!(
         "→ account identity: {}",
         if tokens.account_id.is_some() {

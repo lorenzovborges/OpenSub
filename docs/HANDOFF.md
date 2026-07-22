@@ -101,6 +101,10 @@ auth** (middleware) so the now-public endpoint can't be abused.
 6. **A stopped service could reactivate after binary replacement.** `cursor
    stop` now unloads and disables the LaunchAgent persistently. An explicit
    `cursor proxy` enables it again, and `cursor status` reports that policy.
+7. **Restart raced `launchctl bootout`.** Readiness disappeared before launchd
+   finished unregistering the old job, so an immediate bootstrap could fail
+   with error 5. Lifecycle code now waits for the service registration itself
+   to disappear before bootstrapping the replacement.
 
 ---
 
@@ -126,9 +130,30 @@ auth** (middleware) so the now-public endpoint can't be abused.
   requested model, reasoning parameter, 75 MCP tools, KV blobs, and Exec flow.
 - Transparent selective bridge implemented: OpenAI model IDs route to Codex;
   Composer, Grok, Claude, Gemini, and unknown models pass through to Cursor.
-- Agent text stream, prefetched conversation-blob ingestion, MCP/core tool
-  execution loop, token usage, and Connect end-stream encoding implemented in
+- Agent text stream, prefetched textual conversation-state decoding (root
+  prompts, compacted summary, prior user/assistant turns, and blob-backed user
+  text), trusted read-only replay from Cursor's local JSONL transcript, and a
+  bounded memory cache keyed by `conversation_id`. Workspace rules, skill
+  descriptions, and subagent descriptions are preserved. MCP/core tool
+  execution, token usage, and Connect end-stream encoding are implemented in
   Rust.
+- A 93 MB observe-only native trace (24 Agent streams, 83,280 contiguous JSONL
+  records) was reconstructed without protobuf or Connect framing errors. It
+  covered parent GPT/Grok turns, 17 GPT-5.6 Sol Extra High subagents, shell,
+  reads, grep, writes, MCP, Task, and an interactive question.
+- Native-trace comparison corrected shell from obsolete field 2 to current
+  field 14. Start/stdout/stderr/completion/background events are accumulated,
+  and completed UI frames now carry Cursor's call ID and start/end timestamps.
+- MCP now follows Cursor's `GetMcpTools`/`CallMcpTool` discovery flow instead of
+  injecting every MCP function into the Responses request. Calls still execute
+  in Cursor through field 11.
+- Native Task/subagent relay implemented: OpenSub translates the Task schema and
+  protobuf lifecycle while Cursor's harness owns subagent creation and execution.
+  An explicit Task model wins; otherwise the subagent inherits the parent Cursor
+  model and reasoning variant instead of falling back to Cursor Auto. A clean
+  release probe confirms `gpt-5.6-sol` is accepted and returned by the
+  ChatGPT/Codex backend. Focused tests pass; the corrected live child model still
+  needs fresh validation.
 - Live official-Cursor text turns route to OpenSub and complete.
 - Live workspace-tool turn verified with `read_file`, `shell`, `list_dir`, and
   `grep`; every request received a matching result and the generation completed.
@@ -137,17 +162,27 @@ auth** (middleware) so the now-public endpoint can't be abused.
 - Native-model routing no longer requires the action to contain a user message.
 - `cursor stop` remains disabled across macOS logins until an explicit start.
 - Dependency cleanup reduced the release binary to approximately 4.1 MB; the
-  current suite contains 22 passing tests and Clippy passes with warnings denied.
+  current suite contains 43 passing tests and Clippy passes with warnings denied.
 - The legacy managed Cursor copy and its hidden CLI commands were removed after
   the transparent bridge passed validation.
 - README + ARCHITECTURE docs.
+- Opt-in full protocol tracing through `opensub cursor proxy --trace`, with
+  correlated parent/subagent Cursor frames, Codex request bodies and SSE, and
+  tool results in a local mode-0600 JSONL file capped at 512 MiB.
+- Observe-only native tracing through `opensub cursor trace`; it bypasses all
+  OpenSub routing and records the unchanged bidirectional Cursor Agent body as a
+  baseline for protocol comparison.
 
 ### 🟡 Known limitation
-- Transparent mode currently uses the current prompt plus blobs prefetched by
-  Cursor. Active fetching of every referenced historical KV blob is not yet
-  implemented, so some older conversation context may be absent.
+- Historical tool-call/result protobuf variants are not replayed into a later
+  request verbatim, and blobs omitted from Cursor's prefetch are not actively
+  fetched. Text from main-agent and subagent history is recovered from Cursor's
+  local transcript when available, including after a worker restart, but an old
+  tool result with no later textual summary may need to be fetched again.
 - The latest native internal-action routing fix is covered by a focused unit
   test but still needs a fresh live Cursor passthrough validation.
+- The native `AskQuestion` field 7 / client field 6 interaction is documented by
+  the trace but is not yet emitted by OpenSub; the model can still ask in text.
 
 ### ❌ Not done (future work)
 - Broader unit tests with recorded SSE fixtures.

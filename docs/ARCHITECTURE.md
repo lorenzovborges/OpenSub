@@ -320,10 +320,21 @@ bundled.)
   fields, Connect framing, or tool shapes and require an OpenSub update.
 - **Unknown OpenAI IDs fall back to `gpt-5.5`.** Set
   `OPENSUB_CURSOR_MODEL` when deterministic upstream selection is required.
-- **Conversation history is partial in transparent mode.** The bridge consumes
-  the current prompt and blobs prefetched in the initial Run request. It does
-  not actively fetch every referenced KV blob, so older turns omitted from the
-  prefetch may be unavailable to Codex.
+- **GPT-5.6 model and effort are separate upstream fields.** Cursor model IDs
+  such as `gpt-5.6-sol-xhigh` are normalized to model `gpt-5.6-sol` plus
+  `reasoning.effort = xhigh`. A clean release probe returned
+  `response.model = gpt-5.6-sol`; stale local binaries can produce misleading
+  probe results after source changes.
+- **Historical tool payloads are not replayed verbatim.** The bridge decodes
+  Cursor's prefetched root prompt JSON, active conversation summary, prior user
+  messages, and prior assistant messages. When those blobs are absent, it reads
+  text messages from Cursor's local conversation transcript. Tool calls without
+  textual follow-up are not reconstructed as exact Responses call/result pairs.
+- **The local conversation cache is memory-only, but text history is not limited
+  to that cache.** Successful OpenSub turns are cached by Cursor
+  `conversation_id`, including Responses tool-call/output items. Across worker
+  restarts, the bridge can recover user/assistant text from Cursor's own local
+  transcript when its path is present and passes the trusted-path checks.
 - **Tests are focused, not exhaustive.** Current unit tests cover Responses-shaped
   custom tools and tool-call SSE translation; broader recorded fixtures would
   still help.
@@ -362,6 +373,31 @@ Cursor passthrough, telemetry, context preparation, and tool lifecycle details
 remain available in `events.jsonl` or at `DEBUG`, but do not pollute normal
 output. Every intercepted-request line includes the exact Cursor model name.
 
+`opensub cursor proxy --trace` adds an explicit, sensitive full-protocol trace
+at `~/.opensub/cursor-proxy/protocol-trace.jsonl`. Each JSONL record has a
+monotonic sequence number and local request ID so concurrent parent/subagent
+streams can be reconstructed. Captured directions include decoded Cursor Agent
+protobuf, full Responses request JSON, every parsed upstream SSE event, tool
+results returned by Cursor, and encoded frames sent back to Cursor. OAuth tokens,
+authorization headers, and native-model passthrough are excluded. The file is
+mode `0600`, buffered to limit diagnostic overhead, capped at 512 MiB, preserved
+by `cursor stop`, removed by `cursor uninstall`, and truncated when a new trace
+session starts.
+
+`opensub cursor trace` is a separate observe-only baseline mode. The bridge
+still uses process-scoped Local Capture, but every Agent stream, including GPT
+models, is forwarded byte-for-byte to the original Cursor host. OpenSub does not
+construct a Codex request, run its tool loop, or alter model selection. Raw
+request and response body chunks plus safe route/status metadata are written to
+`cursor-native-trace.jsonl`, keyed by the same monotonic sequence and local
+request IDs. Authentication headers are forwarded as required but never copied
+into the trace. This native capture is the comparison fixture for improving the
+OpenSub translation path. Protocol bodies can themselves carry credentials,
+including custom-provider configuration passed to a subagent, so header
+exclusion does not make a raw trace safe to share.
+`scripts/analyze_cursor_trace.py` produces a content-free structural report by
+default and forces private modes on reports and optional raw-frame dumps.
+
 The local bridge uses TLS with HTTP/2 ALPN because Cursor's Agent transport is a
 bidirectional Connect stream. OpenSub generates one private local CA, installs
 that exact certificate in the user's login Keychain, verifies both its SHA-256
@@ -387,13 +423,81 @@ of `AgentService/Run`; response buffering would deadlock a tool turn because
 OpenSub waits for an `ExecClientMessage` while Cursor waits to receive the
 corresponding `ExecServerMessage`.
 
-Prefetched conversation blobs are folded into the Responses input, MCP
-definitions become Responses function tools, and core workspace operations
-become native `ExecServerMessage` requests. Local execution messages match
-Cursor's own mock Agent shape (`id` plus the selected args oneof, without a
-synthetic `exec_id`). Tool results returned as `ExecClientMessage` are fed into
-the next Responses round. Text deltas, tool lifecycle updates, token usage, and
+`AgentRunRequest.conversation_state` is a `ConversationStateStructure`. Its root
+prompt, turn, and summary fields are blob IDs resolved from
+`AgentRunRequest.pre_fetched_blobs`. Root blobs contain prompt JSON. Turn blobs
+contain `ConversationTurnStructure` protobuf messages whose user message and
+step fields point to further prefetched protobuf blobs. User text becomes a
+Responses user message, assistant steps become Responses assistant messages,
+and the active `ConversationSummary` is added to the instructions. A
+`UserMessage.text_blob_id` is resolved through the same prefetched map.
+
+Context parsing is best-effort: missing blobs and unknown historical turn
+variants are omitted instead of failing the live request. This matters because
+the Agent protocol is internal and Cursor may vary prefetch coverage.
+
+In current official-Cursor traffic, `ConversationStateStructure` can contain
+many root/turn IDs while `pre_fetched_blobs` is empty. `ConversationCache`
+therefore records each successfully completed OpenSub turn under field 5
+(`conversation_id`) and injects those Responses items into the next intercepted
+request. It is bounded to 32 conversations, 64 turns per conversation, and 2 MiB
+per conversation. Oversized turns retain only user/assistant message items. No
+prompt or tool content from this cache is persisted or logged.
+
+The bridge also resolves the transcript directory from the Cursor environment
+inside `UserMessage.context`. Main-agent transcripts are located by
+`conversation_id`; subagent transcripts use parent field 16 and its `subagents`
+directory. The canonical file must remain under `~/.cursor/projects`, IDs may
+contain only ASCII alphanumerics, `_`, or `-`, only the final 4 MiB of a large
+file is read, and replay is capped at 128 text messages / 2 MiB. The current
+user prompt is removed before it is appended as the active Responses input.
+OpenSub never writes or modifies Cursor transcripts.
+
+Cursor workspace context is not limited to conversation blobs. The bridge
+preserves the workspace root, branch, shell, timezone, always-applied rules,
+available skill descriptions, and available subagent descriptions from the
+Run request, with a 256 KiB instruction cap. Account/session identifiers and
+other unrelated context fields are deliberately excluded.
+
+Core workspace operations become Responses tool schemas and native
+`ExecServerMessage` requests; execution remains inside Cursor. MCP follows the
+official discovery-first shape: Responses sees `GetMcpTools` and `CallMcpTool`,
+`GetMcpTools` filters the schemas already supplied by Cursor's Run context, and
+`CallMcpTool` becomes field 11 for Cursor's harness. OpenSub no longer injects
+every MCP function into each Responses request. The bridge preserves both the
+short provider name (for example `linear`, field 4) and Cursor's server ID (for
+example `plugin-linear-linear`, field 9); they are not interchangeable.
+
+Current Cursor shell execution uses `ExecServerMessage` field 14. Cursor returns
+multiple field-14 client events: start, stdout/stderr chunks, then completion or
+background-process state. OpenSub accumulates these events and only closes the
+tool after a terminal event. The completed UI frame includes Cursor's display
+lifecycle metadata (call ID plus start/end timestamps), preventing tools from
+remaining visually stuck in the running state. Field 2 was an older shell shape
+and causes `Parsing result is required` in current Cursor builds.
+
+The `task` schema maps to `ExecServerMessage.subagent_args` (field 28), so the
+official Cursor harness creates and runs the subagent. Its
+`ExecClientMessage.subagent_result` is converted back to a native
+`TaskToolCall` (field 19) and a Responses function result. Local execution
+messages match Cursor's own mock Agent shape (`id` plus the selected args oneof,
+without a synthetic `exec_id`). Tool results returned as `ExecClientMessage`
+are fed into the next Responses round. Text deltas, tool lifecycle updates, token usage, and
 the Connect end-stream envelope are encoded back as `AgentServerMessage` frames.
+
+`SubagentArgs.model_id` uses the Task call's explicit `model` when present. If
+the call omits it, OpenSub copies the parent Cursor model plus reasoning
+variant, such as `gpt-5.6-sol-xhigh`; leaving this protobuf field empty makes
+Cursor select Auto. Parent effort is accepted from `reasoning`, `effort`,
+`reasoning_effort`, or a model suffix. OpenAI-family child requests pass through
+the same selective interception path, while an explicitly selected native model
+remains on Cursor's backend.
+
+Agent turns have no fixed local tool-round limit. The loop continues until the
+model emits no tool call, the upstream fails, or Cursor closes the execution
+stream. Because `parallel_tool_calls` is disabled, one round normally
+corresponds to one tool execution. A buggy model can therefore loop and consume
+subscription usage until the request is cancelled.
 
 The bridge logs route metadata only. Prompt bodies, Cursor authorization
 headers, OAuth tokens, blob values, tool arguments, and tool outputs are not

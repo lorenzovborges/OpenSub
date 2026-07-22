@@ -15,6 +15,9 @@ pub const SCOPES: &str = "openid profile email offline_access";
 /// Default Codex models exposed via `/v1/models`.
 /// Editable list — Cursor must add these names under Settings → Models.
 pub const DEFAULT_MODELS: &[&str] = &[
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
     "gpt-5.5",
     "gpt-5.1-codex",
     "gpt-5.1",

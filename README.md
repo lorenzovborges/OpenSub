@@ -51,7 +51,18 @@ random per-process secret.
 
 For OpenAI-family requests, OpenSub translates Cursor's Connect/protobuf Agent
 stream to the Codex Responses protocol. Cursor still executes workspace tools
-locally. Native model traffic is passed through as a byte stream to Cursor.
+and subagents in its own harness; OpenSub only relays their schemas, calls, and
+results. Native model traffic is passed through as a byte stream to Cursor.
+
+OpenSub reconstructs each intercepted request with Cursor's root prompts,
+conversation summary, prior user messages, and prior assistant messages. This
+uses prefetched Cursor blobs when available, Cursor's local per-conversation
+transcript when the Agent request provides its trusted project path, and a
+bounded in-memory cache for turns completed through OpenSub. OpenSub only reads
+the transcript; Cursor owns and writes it. The local transcript lets GPT turns
+retain text history across worker restarts and after native-model turns. Exact
+historical tool-result payloads are still best-effort and may need to be
+re-read by the model.
 
 ## Requirements
 
@@ -120,23 +131,32 @@ In Cursor:
 | `gpt-*`, `chatgpt-*`, `o1`-`o9*`, `*codex*` | OpenSub / ChatGPT Codex backend |
 | Composer, Grok, Claude, Gemini, Kimi, GLM, unknown models | Cursor backend |
 
-Recognized Codex model IDs are preserved when possible. Unknown OpenAI-family
+Recognized Codex model IDs, including `gpt-5.6-sol`, `gpt-5.6-terra`, and
+`gpt-5.6-luna`, are preserved. A reasoning suffix such as `-xhigh` is removed
+from the upstream model ID and sent as `reasoning.effort`. Unknown OpenAI-family
 IDs fall back to `gpt-5.5`. Set `OPENSUB_CURSOR_MODEL` before running
 `opensub cursor proxy` to force a specific upstream model.
+
+Cursor subagents inherit the parent's Cursor model and reasoning variant when
+the Task call does not choose one explicitly. For example, a parent using
+`gpt-5.6-sol` at Extra High creates the child with `gpt-5.6-sol-xhigh`. An
+explicit Task model still takes precedence. A child using an OpenAI-family
+model is intercepted by OpenSub like any other Agent run.
 
 ## Service lifecycle
 
 | Action | Command | Result |
 |---|---|---|
 | Install, update, or start | `opensub cursor proxy` | Enables and starts the LaunchAgent |
+| Observe native Cursor | `opensub cursor trace` | Forwards everything to Cursor cloud and records the Agent body |
 | Inspect | `opensub cursor status` | Reports active, starting, stopped, or not installed |
 | Stop | `opensub cursor stop` | Stops and disables it across future macOS logins |
-| Start again | `opensub cursor proxy` | Re-enables and starts it |
-| Uninstall service | `opensub cursor uninstall` | Removes plist and service logs; keeps OAuth and local CA |
+| Start again | `opensub cursor proxy` or `opensub cursor trace` | Re-enables the selected mode |
+| Uninstall service | `opensub cursor uninstall` | Removes plist, service logs, and traces; keeps OAuth and local CA |
 
 While enabled, the LaunchAgent starts automatically when the user logs in and
 restarts the worker if it exits. `cursor stop` is persistent: the service stays
-disabled until another explicit `cursor proxy` command.
+disabled until another explicit `cursor proxy` or `cursor trace` command.
 
 ## Update
 
@@ -208,6 +228,8 @@ opensub logout                  Delete stored OAuth tokens
 opensub probe                   Send a minimal Codex request for diagnosis
 
 opensub cursor proxy            Install/update/start transparent routing
+opensub cursor proxy --trace    Start routing with a full local protocol trace
+opensub cursor trace            Observe the untouched official Cursor flow
 opensub cursor status           Show LaunchAgent health and policy
 opensub cursor stop             Stop and disable transparent routing
 opensub cursor uninstall        Remove the LaunchAgent and service logs
@@ -290,6 +312,42 @@ prompts, OAuth tokens, Cursor authorization headers, tool arguments, tool
 outputs, or fetched blob contents. Diagnostic protocol captures are the
 exception and can contain prompt data.
 
+There are two distinct full-trace modes:
+
+```bash
+# OpenSub still routes GPT requests to Codex and records the translated flow.
+opensub cursor proxy --trace
+
+# OpenSub does not route or translate anything; Cursor uses its own cloud.
+opensub cursor trace
+```
+
+`proxy --trace` writes `protocol-trace.jsonl` and includes Cursor protobuf,
+normalized routing metadata, complete Codex Responses request bodies, SSE,
+tool/subagent results, and frames returned to Cursor. `cursor trace` writes
+`cursor-native-trace.jsonl` and records the raw bidirectional Agent request and
+response body chunks while forwarding them unchanged to Cursor's cloud. It is
+the reference capture for studying Cursor's official harness behavior.
+
+Both files live under `~/.opensub/cursor-proxy/`, use mode `0600`, exclude
+authentication headers and OAuth tokens, are capped at 512 MiB, and are
+replaced when their respective mode starts again. Stop collection with
+`opensub cursor stop`. Treat either trace as sensitive: it can contain prompts,
+source code, terminal output, third-party tool data, and credentials embedded
+inside protobuf bodies (for example a custom provider key passed to a
+subagent), even though HTTP authentication headers are excluded.
+
+Generate a content-free structural report from a native trace with:
+
+```bash
+python3 scripts/analyze_cursor_trace.py \
+  ~/.opensub/cursor-proxy/cursor-native-trace.jsonl
+```
+
+Raw frame extraction is available through `--dump-frames`, but those files are
+sensitive. The analyzer creates reports and dumps with mode `0600` and dump
+directories with mode `0700`.
+
 Read [SECURITY.md](SECURITY.md) before exposing the HTTP API or reporting a
 vulnerability.
 
@@ -331,6 +389,28 @@ Inspect `events.jsonl`. A healthy tool turn has both `tool_requested` and
 cargo install --path . --locked --force
 opensub cursor proxy
 ```
+
+Current builds expose MCP to the model through `GetMcpTools` and `CallMcpTool`,
+matching Cursor's discovery-first flow. The actual MCP call still runs in
+Cursor's harness; OpenSub only translates its request and result.
+
+### Shell fails with `Parsing result is required`
+
+Install the current build. Cursor's current Agent protocol uses shell execution
+field `14` and streams start/output/completion events; older OpenSub builds used
+the obsolete field `2` shape and treated the first stream event as the result.
+
+```bash
+cargo install --path . --locked --force
+opensub cursor proxy
+```
+
+### A tool turn keeps running without finishing
+
+OpenSub does not impose a fixed tool-round limit. A turn continues while the
+model requests tools and ends when the model returns a final response, an
+upstream error occurs, or Cursor closes the stream. Cancel the request in
+Cursor if the model enters a repetitive tool loop.
 
 ### `Network disconnected` or `ERR_CERT_AUTHORITY_INVALID`
 

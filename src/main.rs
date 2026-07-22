@@ -78,9 +78,16 @@ enum CursorCommand {
     Proxy {
         /// Save the latest Agent request for protocol analysis. The capture may
         /// contain prompt context and is stored locally with mode 0600.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "trace")]
         capture_protocol: bool,
+        /// Record complete intercepted OpenAI protocol traffic locally. The
+        /// trace can contain prompts, source code, and tool results.
+        #[arg(long)]
+        trace: bool,
     },
+    /// Observe the unmodified official Cursor Agent stream without routing it
+    /// through OpenSub. The native trace contains sensitive user data.
+    Trace,
     /// Show whether persistent Cursor routing is installed and active.
     Status,
     /// Stop Cursor routing until it is explicitly started again.
@@ -163,13 +170,19 @@ fn parse_level_name(value: &str) -> Option<LevelFilter> {
 async fn cursor_command(command: Option<CursorCommand>) -> Result<()> {
     match command.unwrap_or(CursorCommand::Proxy {
         capture_protocol: false,
+        trace: false,
     }) {
         CursorCommand::Proxy {
-            capture_protocol: false,
-        } => cursor_proxy::ensure_service().await,
-        CursorCommand::Proxy {
-            capture_protocol: true,
-        } => cursor_proxy::run_diagnostic().await,
+            capture_protocol,
+            trace,
+        } => {
+            if capture_protocol {
+                cursor_proxy::run_diagnostic().await
+            } else {
+                cursor_proxy::ensure_service(trace, false).await
+            }
+        }
+        CursorCommand::Trace => cursor_proxy::ensure_service(false, true).await,
         CursorCommand::Status => cursor_proxy::service_status(),
         CursorCommand::Stop => cursor_proxy::service_stop(),
         CursorCommand::Uninstall => cursor_proxy::service_uninstall(),

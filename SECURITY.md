@@ -66,6 +66,20 @@ persisted HTTP API key.
 Normal logs contain route and lifecycle metadata only. The diagnostic
 `opensub cursor proxy --capture-protocol` file can contain prompt context and
 must be handled as sensitive user data. It is not suitable for normal usage.
+The opt-in `opensub cursor proxy --trace` file is more sensitive: it records
+complete intercepted OpenAI prompts, code, tool arguments/results, upstream SSE,
+and Cursor protocol frames. It excludes authentication headers, OAuth tokens,
+and native-model passthrough, but must still be reviewed and redacted before it
+is shared. `cursor stop` preserves the trace for analysis; `cursor uninstall`
+deletes it.
+`opensub cursor trace` records raw body traffic from the official Cursor Agent
+service without routing through Codex. It also excludes HTTP authentication
+headers, but the protocol body can contain the full conversation, workspace
+context, tool data, server responses, and credentials embedded in the protobuf
+body (for example custom-provider configuration passed to a subagent). Header
+exclusion is not sufficient before sharing a trace. The structural analyzer is
+content-free by default; reports and optional raw-frame dumps are created with
+mode `0600`, and dump directories use `0700`.
 
 ## Operational requirements
 

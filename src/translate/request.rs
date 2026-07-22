@@ -1,6 +1,7 @@
 //! Translate a Chat Completions request into a Responses request.
 
 use anyhow::Result;
+use sha2::{Digest, Sha256};
 
 use crate::types::chat::ChatCompletionRequest;
 use crate::types::responses::{MessageContent, ResponseInputItem, ResponsesRequest};
@@ -46,14 +47,14 @@ pub fn translate(req: &ChatCompletionRequest) -> Result<ResponsesRequest> {
                 for tc in &msg.tool_calls {
                     out.input.push(ResponseInputItem::FunctionCall {
                         kind: "function_call".to_string(),
-                        call_id: tc.id.clone(),
+                        call_id: normalize_call_id(&tc.id),
                         name: tc.function.name.clone(),
                         arguments: tc.function.arguments.clone(),
                     });
                 }
             }
             "tool" => {
-                let call_id = msg.tool_call_id.clone().unwrap_or_default();
+                let call_id = normalize_call_id(msg.tool_call_id.as_deref().unwrap_or_default());
                 out.input.push(ResponseInputItem::FunctionCallOutput {
                     kind: "function_call_output".to_string(),
                     call_id,
@@ -117,6 +118,20 @@ pub fn translate(req: &ChatCompletionRequest) -> Result<ResponsesRequest> {
     Ok(out)
 }
 
+pub(crate) fn normalize_call_id(call_id: &str) -> String {
+    const MAX_CALL_ID_CHARS: usize = 64;
+    if call_id.chars().count() <= MAX_CALL_ID_CHARS {
+        return call_id.to_string();
+    }
+
+    let digest = Sha256::digest(call_id.as_bytes());
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("call_{}", &hex[..MAX_CALL_ID_CHARS - 5])
+}
+
 /// Normalize a message's `content` (which may be a string or an array of content
 /// parts) into a single string.
 fn content_to_string(content: &Option<serde_json::Value>) -> Option<String> {
@@ -133,5 +148,45 @@ fn content_to_string(content: &Option<serde_json::Value>) -> Option<String> {
             if out.is_empty() { None } else { Some(out) }
         }
         _ => Some(value.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::chat::ChatCompletionRequest;
+
+    #[test]
+    fn long_tool_call_ids_remain_correlated_after_translation() {
+        let long_id = "cursor-tool-call-".repeat(6);
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": long_id,
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": long_id, "content": "done"}
+            ]
+        }))
+        .unwrap();
+
+        let translated = translate(&request).unwrap();
+        let call_id = match &translated.input[0] {
+            ResponseInputItem::FunctionCall { call_id, .. } => call_id,
+            item => panic!("expected function call, got {item:?}"),
+        };
+        let output_call_id = match &translated.input[1] {
+            ResponseInputItem::FunctionCallOutput { call_id, .. } => call_id,
+            item => panic!("expected function call output, got {item:?}"),
+        };
+
+        assert_eq!(call_id, output_call_id);
+        assert_eq!(call_id.chars().count(), 64);
+        assert!(call_id.starts_with("call_"));
     }
 }

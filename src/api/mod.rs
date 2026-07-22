@@ -167,6 +167,7 @@ fn normalize_responses_request(body: &mut Value) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("prepared body must be a JSON object"))?;
 
     lift_system_instructions(obj);
+    normalize_input_call_ids(obj);
 
     if let Some(model) = obj.get("model").and_then(Value::as_str)
         && let Some(stripped) = model.strip_suffix("-extra")
@@ -208,6 +209,24 @@ fn normalize_responses_request(body: &mut Value) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn normalize_input_call_ids(obj: &mut Map<String, Value>) {
+    let Some(input) = obj.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in input {
+        let Some(item) = item.as_object_mut() else {
+            continue;
+        };
+        let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let normalized = translate::request::normalize_call_id(call_id);
+        if normalized != call_id {
+            item.insert("call_id".to_string(), Value::String(normalized));
+        }
+    }
 }
 
 fn lift_system_instructions(obj: &mut Map<String, Value>) {
@@ -415,6 +434,35 @@ mod tests {
                 .unwrap()
                 .contains(&json!("reasoning.encrypted_content"))
         );
+    }
+
+    #[test]
+    fn responses_shaped_body_normalizes_long_call_ids() {
+        let long_id = "cursor-tool-call-".repeat(6);
+        let raw = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": long_id,
+                    "name": "lookup",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": long_id,
+                    "output": "done"
+                }
+            ]
+        });
+
+        let prepared = prepare_upstream_body(raw).unwrap();
+        let call_id = prepared.body["input"][0]["call_id"].as_str().unwrap();
+        let output_call_id = prepared.body["input"][1]["call_id"].as_str().unwrap();
+
+        assert_eq!(call_id, output_call_id);
+        assert_eq!(call_id.chars().count(), 64);
+        assert!(call_id.starts_with("call_"));
     }
 
     #[test]
